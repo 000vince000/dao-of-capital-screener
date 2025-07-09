@@ -1,0 +1,4 @@
+pandas>=1.4
+beautifulsoup4>=4.12
+requests>=2.31
+yahooquery>=2.3 
