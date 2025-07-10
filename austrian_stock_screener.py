@@ -104,22 +104,28 @@ def _compute_financial_metrics(balance_sheet: pd.DataFrame, income_stmt: pd.Data
         # Required columns unavailable – return empty to mark failure
         return pd.DataFrame()
 
-    # Handle optional liabilities – if not present treat as zero as per notebook.
-    cdl = merged.get("CurrentDeferredLiabilities", 0)
-    ltdclb = merged.get("LongTermDebtAndCapitalLeaseObligation", 0)
-    ncdl = merged.get("NonCurrentDeferredLiabilities", 0)
-    oncl = merged.get("OtherNonCurrentLiabilities", 0)
-    merged["totalDebt"] = cdl + ltdclb + ncdl + oncl
+    # Row-wise debt aggregation
+    debt_cols = [
+        "CurrentDeferredLiabilities",
+        "LongTermDebtAndCapitalLeaseObligation",
+        "NonCurrentDeferredLiabilities",
+        "OtherNonCurrentLiabilities",
+    ]
+    for col in debt_cols:
+        if col not in merged.columns:
+            merged[col] = 0
+    merged["totalDebt"] = merged[debt_cols].fillna(0).sum(axis=1)
 
-    try:
-        merged["preferredequity"] = merged["CapitalStock"] - merged["CommonStock"]
-    except KeyError:
-        return pd.DataFrame()
+    merged["preferredequity"] = (
+        merged.get("CapitalStock", 0) - merged.get("CommonStock", 0)
+    )
 
-    try:
-        merged["networth"] = merged["InvestedCapital"] + merged["CashAndCashEquivalents"] - merged["totalDebt"] - merged["preferredequity"]
-    except KeyError:
-        return pd.DataFrame()
+    merged["networth"] = (
+        merged.get("InvestedCapital", 0)
+        + merged.get("CashAndCashEquivalents", 0)
+        - merged["totalDebt"]
+        - merged["preferredequity"]
+    )
 
     merged["faustmannRatio"] = merged["MarketCap"] / merged["networth"]
 
@@ -435,16 +441,38 @@ def main() -> None:
             print(f"⚠️  Still failed for {len(retry2)} tickers: {', '.join(retry2[:10])}{' …' if len(retry2)>10 else ''}")
 
     # --------------------------------------------------------------
-    # Output
+    # Finalize dataframe: rankings and sanitized ratio
     # --------------------------------------------------------------
-    # Combine with existing if present
+    def _add_rankings(frame: pd.DataFrame) -> pd.DataFrame:
+        tmp = frame.copy()
+        # Sanitize faustmannRatio (negative → NaN)
+        if "faustmannRatio" in tmp.columns:
+            tmp["sanitizedFaustmannRatio"] = tmp["faustmannRatio"].where(tmp["faustmannRatio"] >= 0)
+        else:
+            tmp["sanitizedFaustmannRatio"] = pd.NA
+
+        # ROIC rank high→low (1 = best)
+        if "roic" in tmp.columns:
+            tmp["roicRank"] = tmp["roic"].rank(method="min", ascending=False)
+        else:
+            tmp["roicRank"] = pd.NA
+
+        # Faustmann rank low→high (1 = best)
+        tmp["faustmannRank"] = tmp["sanitizedFaustmannRatio"].rank(method="min", ascending=True)
+
+        # Sum ranks (skip rows with NaNs)
+        tmp["sumRanks"] = tmp[["roicRank", "faustmannRank"]].sum(axis=1, min_count=2)
+        return tmp
+
     if existing_df is not None:
         combined = pd.concat([existing_df, df], ignore_index=True)
         if "symbol" in combined.columns:
             combined = combined.drop_duplicates(subset="symbol", keep="first")
-        combined.to_csv(args.output, sep=";", index=False)
+        final_df = _add_rankings(combined)
+        final_df.to_csv(args.output, sep=";", index=False)
     else:
-        df.to_csv(args.output, sep=";", index=False)
+        final_df = _add_rankings(df)
+        final_df.to_csv(args.output, sep=";", index=False)
     print(f"Saved results → {args.output.resolve()}")
 
 
