@@ -67,7 +67,7 @@ def fetch_russell_1000_tickers(index_url: str = RUSSELL_1000_WIKI) -> List[str]:
     return tickers
 
 
-def _compute_financial_metrics(balance_sheet: pd.DataFrame, income_stmt: pd.DataFrame, details: pd.DataFrame, profile: pd.DataFrame) -> pd.DataFrame:
+def _compute_financial_metrics(balance_sheet: pd.DataFrame, income_stmt: pd.DataFrame, cash_flow: pd.DataFrame, details: pd.DataFrame, profile: pd.DataFrame) -> pd.DataFrame:
     """Merge all fragments and compute the screener metrics for a single symbol."""
     # ------------------------------------------------------------------
     # Merge pieces – resembles the logic in the original notebook.
@@ -75,6 +75,18 @@ def _compute_financial_metrics(balance_sheet: pd.DataFrame, income_stmt: pd.Data
     merged = pd.merge(balance_sheet, income_stmt, on=["symbol"], how="inner", suffixes=("_bs", "_is"))
     if merged.empty:
         return merged  # return empty -> will be skipped by caller
+
+    # --------------------------------------------------------------
+    # Attach Free Cash Flow (FCF) if available in the cash-flow slice
+    # --------------------------------------------------------------
+    if not cash_flow.empty and "FreeCashFlow" in cash_flow.columns:
+        fcf_df = (
+            cash_flow[["symbol", "FreeCashFlow"]]
+            .rename(columns={"FreeCashFlow": "fcf"})
+        )
+        merged = pd.merge(merged, fcf_df, on="symbol", how="left")
+    else:
+        merged["fcf"] = pd.NA
 
     market_cap = details[["marketCap"]].rename(columns={"marketCap": "MarketCap"})
     market_cap.index.name = "symbol"
@@ -129,10 +141,17 @@ def _compute_financial_metrics(balance_sheet: pd.DataFrame, income_stmt: pd.Data
 
     merged["faustmannRatio"] = merged["MarketCap"] / merged["networth"]
 
+    # FCF yield (guard against missing MarketCap)
+    if "MarketCap" in merged.columns:
+        merged["fcfYield"] = merged["fcf"] / merged["MarketCap"]
+    else:
+        merged["fcfYield"] = pd.NA
+
     # Keep only the relevant columns (mirrors the notebook's final selection)
     cols_to_keep = [
         "symbol", "asOfDate", "EBIT", "InvestedCapital", "roic", "MarketCap",
-        "CashAndCashEquivalents", "totalDebt", "preferredequity", "faustmannRatio", "industry"
+        "CashAndCashEquivalents", "totalDebt", "preferredequity", "faustmannRatio",
+        "fcf", "fcfYield", "industry",
     ]
     # Some columns may be missing if upstream keys failed – drop those silently.
     existing_cols = [c for c in cols_to_keep if c in merged.columns]
@@ -270,6 +289,19 @@ def process_universe(
                 .reset_index()
             )
 
+            cf_q_all = fetch_with_backoff(
+                lambda: ticker.cash_flow(frequency="q"),
+                desc=f"batch cash-flow {batch_label}",
+                delay_ref=delay_ref,
+            )
+            cf_q_all = (
+                cf_q_all[cf_q_all["periodType"] == "TTM"]
+                .sort_values("asOfDate")
+                .groupby("symbol")
+                .tail(1)
+                .reset_index()
+            )
+
             details_dict = fetch_with_backoff(
                 lambda: ticker.summary_detail,
                 desc=f"batch summary_detail {batch_label}",
@@ -299,6 +331,7 @@ def process_universe(
 
             bs_row = bs_q_all[bs_q_all["symbol"] == symbol]
             inc_row = inc_q_all[inc_q_all["symbol"] == symbol]
+            cf_row = cf_q_all[cf_q_all["symbol"] == symbol]
 
             if bs_row.empty or inc_row.empty:
                 retry.append(symbol)
@@ -308,7 +341,7 @@ def process_universe(
             profile_row = profile_df.loc[[symbol]] if symbol in profile_df.index else pd.DataFrame()
 
             try:
-                metrics_df = _compute_financial_metrics(bs_row, inc_row, details_row, profile_row)
+                metrics_df = _compute_financial_metrics(bs_row, inc_row, cf_row, details_row, profile_row)
             except Exception as m_exc:
                 print(f"    · metric error {symbol}: {m_exc}")
                 retry.append(symbol)
