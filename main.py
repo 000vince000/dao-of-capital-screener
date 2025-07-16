@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""Pipeline driver that orchestrates the full screening workflow.
+
+Steps:
+1. Run `austrian_stock_screener.py` to refresh `austrian.csv`.
+2. Sort the CSV by `sumRanks` ascending and pick the top *N* tickers (default 50).
+3. Call `compute_roic_slope.py` and `fetch_wacc.py` for this subset.
+4. Merge the key metrics into a concise overview CSV (default: top50_overview.csv).
+
+This script assumes it is executed from the project root where the individual
+Python modules reside.
+"""
+from __future__ import annotations
+
+import argparse
+import subprocess
+import sys
+from pathlib import Path
+from typing import List
+
+import pandas as pd
+
+# --------------------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------------------
+
+
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Run full screener pipeline and produce summary CSV.")
+    p.add_argument(
+        "--top",
+        type=int,
+        default=50,
+        help="Number of tickers to keep after ranking (default: 50)",
+    )
+    p.add_argument(
+        "--output",
+        type=Path,
+        default=Path("top50_overview.csv"),
+        help="Destination CSV filename (default: top50_overview.csv)",
+    )
+    p.add_argument(
+        "--skip-screener",
+        action="store_true",
+        help="Skip running austrian_stock_screener.py if austrian.csv already exists.",
+    )
+    return p.parse_args()
+
+
+# --------------------------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------------------------
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+PYTHON = sys.executable  # current interpreter (inside venv if activated)
+
+
+def _run_script(script: str, *args: str):
+    """Run *script* with given *args* in subprocess and abort on non-zero exit."""
+    cmd = [PYTHON, str(PROJECT_ROOT / script), *args]
+    print(f"→ Running: {' '.join(cmd)}", flush=True)
+    subprocess.run(cmd, check=True)
+
+
+# --------------------------------------------------------------------------------------
+# Main workflow
+# --------------------------------------------------------------------------------------
+
+
+def main() -> None:
+    args = _parse_args()
+
+    austrian_csv = PROJECT_ROOT / "austrian.csv"
+
+    # ------------------------------------------------------------------
+    # 1. Run the screener (unless skipped)
+    # ------------------------------------------------------------------
+    if not args.skip_screener or not austrian_csv.exists():
+        _run_script("austrian_stock_screener.py")
+    else:
+        print("✓ Skipping screener step – austrian.csv already present.")
+
+    if not austrian_csv.exists():
+        print("❌ Expected austrian.csv was not created.", file=sys.stderr)
+        sys.exit(1)
+
+    # ------------------------------------------------------------------
+    # 2. Pick top-N tickers by sumRanks
+    # ------------------------------------------------------------------
+    df_base = pd.read_csv(austrian_csv, sep=";")
+    if "sumRanks" not in df_base.columns:
+        print("❌ Column 'sumRanks' not found in austrian.csv", file=sys.stderr)
+        sys.exit(1)
+
+    df_sorted = df_base.sort_values("sumRanks", ascending=True)
+    top_df = df_sorted.head(args.top)
+    top_tickers: List[str] = top_df["symbol"].dropna().astype(str).tolist()
+
+    if not top_tickers:
+        print("❌ No tickers found after ranking step.", file=sys.stderr)
+        sys.exit(1)
+
+    ticker_str = ",".join(top_tickers)
+
+    # ------------------------------------------------------------------
+    # 3. Compute ROIC slope (result not used here but part of pipeline)
+    # ------------------------------------------------------------------
+    _run_script("compute_roic_slope.py", "--tickers", ticker_str, "--output", "roic_slope_top.csv")
+
+    # ------------------------------------------------------------------
+    # 4. Fetch WACC values for the same tickers
+    # ------------------------------------------------------------------
+    _run_script("fetch_wacc.py", "--tickers", ticker_str, "--output", "wacc_top.csv")
+
+    # ------------------------------------------------------------------
+    # 5. Merge selected metrics into summary CSV
+    # ------------------------------------------------------------------
+    # Reload in case new columns were added by other scripts
+    df_base = pd.read_csv(austrian_csv, sep=";")
+    df_base_subset = df_base[
+        [
+            "symbol",
+            "roic",
+            "MarketCap",
+            "sanitizedFaustmannRatio",
+            "sumRanks",
+            "fcfYield",
+        ]
+    ]
+
+    df_wacc = pd.read_csv("wacc_top.csv", sep=";")
+    df_roic_slope = pd.read_csv("roic_slope_top.csv", sep=";")
+    merged = (
+        top_df[["symbol"]]  # ensure ordering of top tickers
+        .merge(df_base_subset, on="symbol", how="left")
+        .merge(df_wacc[["symbol", "wacc"]], on="symbol", how="left")
+        .merge(df_roic_slope, on="symbol", how="left")
+    )
+
+    merged.to_csv(args.output, sep=";", index=False)
+    print(f"✓ Saved summary → {args.output.resolve()}")
+
+
+if __name__ == "__main__":
+    main() 

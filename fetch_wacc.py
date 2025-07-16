@@ -181,6 +181,20 @@ def main() -> None:
             sys.exit(1)
         tickers = df_in["symbol"].dropna().unique().tolist()
 
+    # Skip symbols already present in the output file (if exists)
+    existing_df = None
+    if args.output.exists():
+        try:
+            existing_df = pd.read_csv(args.output, sep=";")
+            done = set(existing_df["symbol"].dropna().astype(str).unique())
+            remaining = [t for t in tickers if t not in done]
+            skipped = len(tickers) - len(remaining)
+            if skipped:
+                print(f"✓ {skipped} tickers already present in {args.output.name}; skipping fetch.")
+            tickers = remaining
+        except Exception as exc:
+            print(f"⚠️  Could not read existing output file: {exc} – will refetch all tickers.")
+
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT})
 
@@ -191,7 +205,15 @@ def main() -> None:
         rows.append(row)
         time.sleep(1)  # polite delay between requests
 
-    out_df = pd.DataFrame(rows)
+    # Combine with previously fetched rows
+    if existing_df is not None and not existing_df.empty:
+        new_df = pd.DataFrame(rows)
+        combined = pd.concat([existing_df, new_df], ignore_index=True)
+        combined = combined.drop_duplicates(subset="symbol", keep="first")
+        out_df = combined
+    else:
+        out_df = pd.DataFrame(rows)
+
     out_df.to_csv(args.output, sep=";", index=False)
     print(f"Saved WACC values → {args.output.resolve()}")
 

@@ -138,6 +138,20 @@ def main() -> None:
             sys.exit(1)
         tickers = df_in["symbol"].dropna().unique().tolist()
 
+    # Skip symbols already present in the output (if file exists)
+    existing_df = None
+    if args.output.exists():
+        try:
+            existing_df = pd.read_csv(args.output, sep=";")
+            done = set(existing_df["symbol"].dropna().astype(str).unique())
+            remaining = [t for t in tickers if t not in done]
+            skipped = len(tickers) - len(remaining)
+            if skipped:
+                print(f"✓ {skipped} tickers already present in {args.output.name}; skipping.")
+            tickers = remaining
+        except Exception as exc:
+            print(f"⚠️  Could not read existing output file: {exc} – will recompute all tickers.")
+
     rows = []
     for sym in tickers:
         print(f"Processing {sym}…", flush=True)
@@ -149,7 +163,15 @@ def main() -> None:
             "averageROIC": avg,
         })
 
-    out_df = pd.DataFrame(rows)
+    # Combine with any previously existing rows
+    if existing_df is not None and not existing_df.empty:
+        rows_df = pd.DataFrame(rows)
+        combined = pd.concat([existing_df, rows_df], ignore_index=True)
+        # Deduplicate keeping first occurrence (existing data wins)
+        combined = combined.drop_duplicates(subset="symbol", keep="first")
+        out_df = combined
+    else:
+        out_df = pd.DataFrame(rows)
     out_df.to_csv(args.output, sep=";", index=False)
     print(f"Saved slopes → {args.output.resolve()}")
 
