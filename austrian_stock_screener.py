@@ -40,7 +40,7 @@ DEFAULT_RATE_LIMIT_SEC = 0.5
 
 # Maximum number of tickers to process in a single run. The notebook capped this at
 # 1,000 which equals the full Russell-1000 universe. You can override this via CLI.
-DEFAULT_MAX_COUNT = 1000
+DEFAULT_MAX_COUNT = 2000
 
 # --------------------------------------------------------------------------------------
 # Helper functions
