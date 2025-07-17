@@ -3,9 +3,11 @@
 
 Steps:
 1. Run `austrian_stock_screener.py` to refresh `austrian.csv`.
-2. Sort the CSV by `sumRanks` ascending and pick the top *N* tickers (default 50).
-3. Call `compute_roic_slope.py` and `fetch_wacc.py` for this subset.
-4. Merge the key metrics into a concise overview CSV (default: top50_overview.csv).
+2. Run `fetch_wacc.py` to refresh `wacc_top.csv`, with `austrian.csv` as input.
+3. Run `normalized_austrian_screener.py` to refresh `normalized_austrian.csv`, with `austrian.csv` and `wacc_top.csv` as input.
+4. Sort `normalized_austrian.csv` by `sumRanks` ascending and pick the top *N* tickers (default 50).
+5. Call `compute_roic_slope.py` and `compute_roe_scope.py` for this subset.
+6. Merge the key metrics into a concise overview CSV (default: top50_overview.csv).
 
 This script assumes it is executed from the project root where the individual
 Python modules reside.
@@ -104,21 +106,35 @@ def main() -> None:
     ticker_str = ",".join(top_tickers)
 
     # ------------------------------------------------------------------
-    # 3. Compute ROIC slope (result not used here but part of pipeline)
+    # 3. Refresh WACC for entire universe before ranking normalization
+    # ------------------------------------------------------------------
+    _run_script("fetch_wacc.py", "--input", str(austrian_csv), "--output", "wacc_top.csv")
+
+    # ------------------------------------------------------------------
+    # 4. Produce normalized screener with excess returns
+    # ------------------------------------------------------------------
+    _run_script("normalized_austrian_screener.py", "--input", str(austrian_csv), "--wacc-file", "wacc_top.csv", "--output", "normalized_austrian.csv")
+
+    # ------------------------------------------------------------------
+    # 5. Load normalized CSV and pick top-N
+    # ------------------------------------------------------------------
+    norm_df = pd.read_csv("normalized_austrian.csv", sep=";")
+    df_sorted = norm_df.sort_values("sumRanks", ascending=True)
+    top_df = df_sorted.head(args.top)
+    top_tickers = top_df["symbol"].dropna().astype(str).tolist()
+
+    ticker_str = ",".join(top_tickers)
+
+    # ------------------------------------------------------------------
+    # 6. Compute ROIC and ROE slopes for subset
     # ------------------------------------------------------------------
     _run_script("compute_roic_slope.py", "--tickers", ticker_str, "--output", "roic_slope_top.csv")
+    _run_script("compute_roe_slope.py", "--tickers", ticker_str, "--output", "roe_slope_top.csv")
 
     # ------------------------------------------------------------------
-    # 4. Fetch WACC values for the same tickers
+    # 7. Merge selected metrics into summary CSV
     # ------------------------------------------------------------------
-    _run_script("fetch_wacc.py", "--tickers", ticker_str, "--output", "wacc_top.csv")
-
-    # ------------------------------------------------------------------
-    # 5. Merge selected metrics into summary CSV
-    # ------------------------------------------------------------------
-    # Reload in case new columns were added by other scripts
-    df_base = pd.read_csv(austrian_csv, sep=";")
-    df_base_subset = df_base[
+    df_base_subset = norm_df[
         [
             "symbol",
             "roic",
@@ -126,16 +142,19 @@ def main() -> None:
             "sanitizedFaustmannRatio",
             "sumRanks",
             "fcfYield",
+            "excessReturn",
         ]
     ]
 
     df_wacc = pd.read_csv("wacc_top.csv", sep=";")
+    df_roe_slope = pd.read_csv("roe_slope_top.csv", sep=";")
     df_roic_slope = pd.read_csv("roic_slope_top.csv", sep=";")
     merged = (
         top_df[["symbol"]]  # ensure ordering of top tickers
         .merge(df_base_subset, on="symbol", how="left")
         .merge(df_wacc[["symbol", "wacc"]], on="symbol", how="left")
         .merge(df_roic_slope, on="symbol", how="left")
+        .merge(df_roe_slope, on="symbol", how="left")
     )
 
     merged.to_csv(args.output, sep=";", index=False)
