@@ -97,8 +97,11 @@ DEFAULT_TIMEOUT = 10  # seconds
 RETRY_STATUS = {429, 500, 502, 503, 504}
 
 
-def _http_get(url: str, session: requests.Session, max_retries: int = 3) -> requests.Response:
-    """GET *url* with simple retry logic on 429/5xx status codes."""
+def _http_get(url: str, session: requests.Session, *, symbol: str = "", max_retries: int = 3) -> requests.Response:
+    """GET *url* with simple retry logic on 429/5xx status codes.
+
+    The *symbol* argument is only used for clearer logging.
+    """
     for attempt in range(1, max_retries + 1):
         try:
             resp = session.get(url, timeout=DEFAULT_TIMEOUT)
@@ -111,8 +114,8 @@ def _http_get(url: str, session: requests.Session, max_retries: int = 3) -> requ
         except (requests.RequestException, requests.HTTPError) as exc:
             if attempt == max_retries:
                 raise
+            # Quietly back-off; per-symbol retries are reported by outer loop.
             sleep_s = 1.5 * attempt
-            print(f"  · Retry {attempt}/{max_retries} after error: {exc}. Sleeping {sleep_s:.1f}s…", file=sys.stderr)
             time.sleep(sleep_s)
     # Should not reach here.
     raise RuntimeError("Exhausted retries")
@@ -122,21 +125,27 @@ def _http_get(url: str, session: requests.Session, max_retries: int = 3) -> requ
 # Core fetch logic
 # --------------------------------------------------------------------------------------
 
-def fetch_wacc(ticker: str, session: requests.Session) -> Dict[str, Optional[float]]:
-    """Return a dict with WACC metrics for *ticker* (values may be None if unavailable)."""
-    url = f"https://valueinvesting.io/{ticker}/valuation/wacc"
+def fetch_wacc(ticker: str, session: requests.Session) -> tuple[dict, bool]:
+    """Return (row_dict, retryable) where retryable indicates if we should retry on failure."""
+    url_ticker = ticker.replace("-", ".")
+    url = f"https://valueinvesting.io/{url_ticker}/valuation/wacc"
     try:
-        resp = _http_get(url, session=session)
+        resp = _http_get(url, session=session, symbol=ticker)
     except Exception as exc:
         print(f"  · Error fetching {ticker}: {exc}", file=sys.stderr)
-        return {"symbol": ticker, "wacc": None, "costOfEquity": None, "costOfDebt": None}
+        return {"symbol": ticker, "wacc": None, "costOfEquity": None, "costOfDebt": None}, True
 
     if resp.status_code != 200:
         print(f"  · HTTP {resp.status_code} for {ticker} ({url})", file=sys.stderr)
-        return {"symbol": ticker, "wacc": None, "costOfEquity": None, "costOfDebt": None}
+        return {"symbol": ticker, "wacc": None, "costOfEquity": None, "costOfDebt": None}, True
+
+    # If redirect landed at unexpected location treat as non-retryable failure
+    if '/valuation/wacc' not in resp.url:
+        return {"symbol": ticker, "wacc": None, "costOfEquity": None, "costOfDebt": None}, False
 
     wacc, equity, debt = _parse_wacc(resp.text)
-    return {"symbol": ticker, "wacc": wacc, "costOfEquity": equity, "costOfDebt": debt}
+    retryable = wacc is None  # parse failure shouldn't retry
+    return {"symbol": ticker, "wacc": wacc, "costOfEquity": equity, "costOfDebt": debt}, retryable
 
 
 # --------------------------------------------------------------------------------------
@@ -154,13 +163,43 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output",
         type=pathlib.Path,
-        default=pathlib.Path("wacc.csv"),
-        help="Destination CSV filename (default: wacc.csv)",
+        default=pathlib.Path("wacc_top.csv"),
+        help="Destination CSV filename (default: wacc_top.csv)",
     )
     parser.add_argument(
         "--tickers",
         type=str,
         help="Comma-separated list of tickers to process; if omitted use all symbols in --input.",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=5,
+        help="Number of parallel worker threads (default: 5)",
+    )
+    parser.add_argument(
+        "--rate-limit",
+        type=float,
+        default=1.0,
+        help="Minimum seconds between successive outbound requests (default: 1.0)",
+    )
+    parser.add_argument(
+        "--flush-size",
+        type=int,
+        default=10,
+        help="Flush accumulated successful rows to CSV after this many rows (default: 10)",
+    )
+    parser.add_argument(
+        "--failed-output",
+        type=pathlib.Path,
+        default=pathlib.Path("wacc_failed.csv"),
+        help="CSV file to write tickers where page loaded but WACC not found (default: wacc_failed.csv)",
+    )
+    parser.add_argument(
+        "--max-count",
+        type=int,
+        default=None,
+        help="Limit to first N tickers (for testing)",
     )
     return parser.parse_args()
 
@@ -175,35 +214,201 @@ def main() -> None:
         if not args.input.exists():
             print(f"Input file {args.input} not found and --tickers not provided.", file=sys.stderr)
             sys.exit(1)
-        df_in = pd.read_csv(args.input, sep=";")
+        # Load only the 'symbol' column to reduce memory footprint
+        try:
+            df_in = pd.read_csv(args.input, sep=";", usecols=["symbol"])
+        except ValueError:
+            # 'symbol' not in CSV or other issue – fallback to full read for clearer error
+            df_in = pd.read_csv(args.input, sep=";")
         if "symbol" not in df_in.columns:
             print("Input CSV lacks 'symbol' column.", file=sys.stderr)
             sys.exit(1)
         tickers = df_in["symbol"].dropna().unique().tolist()
+
+    # Optional limit for testing
+    if args.max_count is not None:
+        tickers = tickers[: args.max_count]
 
     # Skip symbols already present in the output file (if exists)
     existing_df = None
     if args.output.exists():
         try:
             existing_df = pd.read_csv(args.output, sep=";")
-            done = set(existing_df["symbol"].dropna().astype(str).unique())
-            remaining = [t for t in tickers if t not in done]
-            skipped = len(tickers) - len(remaining)
-            if skipped:
-                print(f"✓ {skipped} tickers already present in {args.output.name}; skipping fetch.")
-            tickers = remaining
-        except Exception as exc:
-            print(f"⚠️  Could not read existing output file: {exc} – will refetch all tickers.")
+        except Exception:
+            # Fallback: sanitize file with extra columns (e.g., stray _retryable)
+            try:
+                tmp_df = pd.read_csv(
+                    args.output,
+                    sep=";",
+                    header=0,
+                    names=["symbol", "wacc", "costOfEquity", "costOfDebt", "_extra"],
+                    engine="python",
+                )
+                tmp_df = tmp_df[["symbol", "wacc", "costOfEquity", "costOfDebt"]]
+                tmp_df.to_csv(args.output, sep=";", index=False)
+                existing_df = tmp_df
+                print("✓ Sanitized malformed rows in existing output file.")
+            except Exception as exc2:
+                print(f"⚠️  Could not sanitize existing output file: {exc2} – will refetch all tickers.")
+                existing_df = None
+
+    # If we have existing_df, apply skip logic
+    if existing_df is not None:
+        done = set(existing_df["symbol"].dropna().astype(str).unique())
+        # Also skip symbols previously marked as failed
+        if args.failed_output.exists():
+            try:
+                fail_df = pd.read_csv(args.failed_output, sep=";")
+                failed_set = set(fail_df["symbol"].dropna().astype(str).unique())
+                done.update(failed_set)
+            except Exception as exc:
+                print(f"⚠️  Could not read failed-output file: {exc}")
+
+        remaining = [t for t in tickers if t not in done]
+        skipped = len(tickers) - len(remaining)
+        if skipped:
+            print(f"✓ {skipped} tickers already processed (success or failed); skipping fetch.")
+        tickers = remaining
 
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT})
 
+    # ------------------------------------------------------------------
+    # Parallel fetch with global pacing
+    # ------------------------------------------------------------------
+
+    import threading
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    rate_interval = args.rate_limit
+    max_workers = args.workers
+
+    class _AdaptiveGate:
+        """Adaptive global pacing gate.
+
+        Starts with `interval` seconds between requests. Doubles interval when
+        throttled, shrinks by 10 % after a streak of `success_threshold` good
+        requests (no throttling).
+        """
+
+        def __init__(self, interval: float, *, min_int: float = 0.05, max_int: float = 5.0, success_threshold: int = 5):
+            self.interval = interval
+            self.min_int = min_int
+            self.max_int = max_int
+            self.success_threshold = success_threshold
+            self._success_streak = 0
+            self._last = 0.0  # monotonic time
+            self._lock = threading.Lock()
+
+        def wait_turn(self):
+            import time as _time
+            with self._lock:
+                now = _time.monotonic()
+                wait = self.interval - (now - self._last)
+                if wait > 0:
+                    _time.sleep(wait)
+                self._last = _time.monotonic()
+
+        def report_success(self):
+            with self._lock:
+                self._success_streak += 1
+                if self._success_streak >= self.success_threshold and self.interval > self.min_int:
+                    self.interval = max(self.interval * 0.85, self.min_int)  # speed up by 15%
+                    self._success_streak = 0
+
+        def report_throttled(self):
+            with self._lock:
+                self.interval = min(self.interval * 1.5, self.max_int)  # gentler back-off
+                self._success_streak = 0
+
+    gate = _AdaptiveGate(rate_interval)
+
+    total = len(tickers)
+
+    def _task(args_tuple):
+        idx, symbol, tot = args_tuple
+        gate.wait_turn()
+        print(f"[{idx}/{tot}] {symbol}  (intvl {gate.interval:.2f}s)", flush=True)
+        sess = requests.Session()
+        sess.headers.update({"User-Agent": USER_AGENT})
+        row, retryable = fetch_wacc(symbol, sess)
+        if row.get("wacc") is None:
+            if retryable:
+                gate.report_throttled()
+            else:
+                gate.report_success()
+        else:
+            gate.report_success()
+        row["_retryable"] = retryable
+        return row
+
+    max_passes = 20  # per-symbol retry passes
+    remaining = tickers
     rows = []
-    for sym in tickers:
-        print(f"Processing {sym}…", flush=True)
-        row = fetch_wacc(sym, session)
-        rows.append(row)
-        time.sleep(1)  # polite delay between requests
+    buffer_rows: list[dict] = []
+    flush_size = args.flush_size
+    header_written = args.output.exists()
+
+    for attempt in range(1, max_passes + 1):
+        if not remaining:
+            break
+        if attempt == 1:
+            print(f"--- Pass 1/{max_passes} starting with {len(remaining)} tickers ---")
+        else:
+            print(f"--- Retry pass {attempt}/{max_passes} for {len(remaining)} tickers ---")
+
+        current_total = len(remaining)
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            future_to_sym = {pool.submit(_task, (idx, sym, current_total)): sym for idx, sym in enumerate(remaining, start=1)}
+            current_rows = []
+            for fut in as_completed(future_to_sym):
+                sym = future_to_sym[fut]
+                try:
+                    row = fut.result()
+                except Exception as exc:
+                    print(f"  · Error in thread for {sym}: {exc}", file=sys.stderr)
+                    row = {"symbol": sym, "wacc": None, "costOfEquity": None, "costOfDebt": None}
+                current_rows.append(row)
+
+        # Determine which tickers failed this pass
+        successes = [r for r in current_rows if not pd.isna(r.get("wacc"))]
+        # Distinguish retryable vs final failures
+        retry_fail = [r["symbol"] for r in current_rows if pd.isna(r.get("wacc")) and r.get("_retryable", True)]
+        final_fail_rows = [r for r in current_rows if pd.isna(r.get("wacc")) and not r.get("_retryable", True)]
+
+        # ----------------------------------------------
+        # Incremental flush of successful rows in batches
+        # ----------------------------------------------
+        # Buffer and flush per --flush-size
+        if successes:
+            buffer_rows.extend(successes)
+            if len(buffer_rows) >= flush_size:
+                df_flush = (
+                    pd.DataFrame(buffer_rows)
+                    .drop_duplicates(subset="symbol", keep="first")
+                    [["symbol", "wacc", "costOfEquity", "costOfDebt"]]
+                )
+                df_flush.to_csv(
+                    args.output,
+                    sep=";",
+                    index=False,
+                    mode="a" if header_written else "w",
+                    header=not header_written,
+                )
+                header_written = True
+                buffer_rows.clear()
+
+        rows.extend(successes)
+        remaining = retry_fail
+        # On failure pass increase interval modestly to be polite
+        if remaining:
+            gate.report_throttled()
+
+        # write final_fail_rows to failed_output immediately
+        if final_fail_rows:
+            df_fail = pd.DataFrame(final_fail_rows)[["symbol"]]
+            df_fail.to_csv(args.failed_output, sep=";", index=False, mode="a", header=not args.failed_output.exists())
+
 
     # Combine with previously fetched rows
     if existing_df is not None and not existing_df.empty:
@@ -214,8 +419,38 @@ def main() -> None:
     else:
         out_df = pd.DataFrame(rows)
 
-    out_df.to_csv(args.output, sep=";", index=False)
+    # Final flush for any remaining buffered rows
+    if buffer_rows:
+        df_flush = (
+            pd.DataFrame(buffer_rows)
+            .drop_duplicates(subset="symbol", keep="first")
+            [["symbol", "wacc", "costOfEquity", "costOfDebt"]]
+        )
+        df_flush.to_csv(
+            args.output,
+            sep=";",
+            index=False,
+            mode="a" if header_written else "w",
+            header=not header_written,
+        )
+        header_written = True
+        rows.extend(buffer_rows)
+
+    # Final deduplication pass: read the file, drop any duplicate symbols, rewrite.
+    try:
+        df_all = pd.read_csv(args.output, sep=";")
+        df_all = df_all[["symbol", "wacc", "costOfEquity", "costOfDebt"]]
+        df_all = df_all.drop_duplicates(subset="symbol", keep="first")
+        df_all.to_csv(args.output, sep=";", index=False)
+    except Exception as exc:
+        print(f"⚠️  Could not finalize deduplication: {exc}", file=sys.stderr)
+
     print(f"Saved WACC values → {args.output.resolve()}")
+
+    if remaining:
+        df_remaining = pd.DataFrame({"symbol": remaining})
+        df_remaining.to_csv(args.failed_output, sep=";", index=False, mode="a", header=not args.failed_output.exists())
+        print(f"⚠️  Failed to fetch WACC for {len(remaining)} tickers after {max_passes} retries. Logged to {args.failed_output}", file=sys.stderr)
 
 
 if __name__ == "__main__":
