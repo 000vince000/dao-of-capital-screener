@@ -67,7 +67,7 @@ def fetch_russell_1000_tickers(index_url: str = RUSSELL_1000_WIKI) -> List[str]:
     return tickers
 
 
-def _compute_financial_metrics(balance_sheet: pd.DataFrame, income_stmt: pd.DataFrame, cash_flow: pd.DataFrame, details: pd.DataFrame, profile: pd.DataFrame) -> pd.DataFrame:
+def _compute_financial_metrics(balance_sheet: pd.DataFrame, income_stmt: pd.DataFrame, cash_flow: pd.DataFrame, details: pd.DataFrame, profile: pd.DataFrame, valuation: pd.DataFrame | None = None) -> pd.DataFrame:
     """Merge all fragments and compute the screener metrics for a single symbol."""
     # ------------------------------------------------------------------
     # Merge pieces – resembles the logic in the original notebook.
@@ -77,16 +77,18 @@ def _compute_financial_metrics(balance_sheet: pd.DataFrame, income_stmt: pd.Data
         return merged  # return empty -> will be skipped by caller
 
     # --------------------------------------------------------------
-    # Attach Free Cash Flow (FCF) if available in the cash-flow slice
+    # Attach Operating Cash Flow (OpCF).
+    # If the cash-flow slice contains `OperatingCashFlow`, merge it as `opCashFlow`.
+    # Otherwise leave `opCashFlow` as missing (pd.NA).
     # --------------------------------------------------------------
-    if not cash_flow.empty and "FreeCashFlow" in cash_flow.columns:
-        fcf_df = (
-            cash_flow[["symbol", "FreeCashFlow"]]
-            .rename(columns={"FreeCashFlow": "fcf"})
+    if not cash_flow.empty and "OperatingCashFlow" in cash_flow.columns:
+        ocf_df = (
+            cash_flow[["symbol", "OperatingCashFlow"]]
+            .rename(columns={"OperatingCashFlow": "opCashFlow"})
         )
-        merged = pd.merge(merged, fcf_df, on="symbol", how="left")
+        merged = pd.merge(merged, ocf_df, on="symbol", how="left")
     else:
-        merged["fcf"] = pd.NA
+        merged["opCashFlow"] = pd.NA
 
     market_cap = details[["marketCap"]].rename(columns={"marketCap": "MarketCap"})
     market_cap.index.name = "symbol"
@@ -141,11 +143,31 @@ def _compute_financial_metrics(balance_sheet: pd.DataFrame, income_stmt: pd.Data
 
     merged["faustmannRatio"] = merged["MarketCap"] / merged["networth"]
 
-    # FCF yield (guard against missing MarketCap)
-    if "MarketCap" in merged.columns:
-        merged["fcfYield"] = merged["fcf"] / merged["MarketCap"]
+    # --------------------------------------------------------------
+    # Enterprise Value – prefer Yahoo's direct figure; otherwise compute
+    # manually:  EV = MarketCap + totalDebt + preferredequity - Cash
+    # --------------------------------------------------------------
+    ev_value = pd.NA
+    if valuation is not None and not valuation.empty and "EnterpriseValue" in valuation.columns:
+        ev_candidate = valuation["EnterpriseValue"].iloc[0]
+        if pd.notna(ev_candidate):
+            ev_value = ev_candidate
+
+    if pd.isna(ev_value):
+        ev_value = (
+            merged.get("MarketCap", pd.NA)
+            + merged.get("totalDebt", 0).fillna(0)
+            + merged.get("preferredequity", 0).fillna(0)
+            - merged.get("CashAndCashEquivalents", 0).fillna(0)
+        )
+
+    merged["EnterpriseValue"] = ev_value
+
+    # Operating Cash Flow yield relative to Enterprise Value
+    if "EnterpriseValue" in merged.columns:
+        merged["opCashFlowYield"] = merged["opCashFlow"] / merged["EnterpriseValue"]
     else:
-        merged["fcfYield"] = pd.NA
+        merged["opCashFlowYield"] = pd.NA
 
     # ------------------------------------------------------------------
     # ROE computation (Net Income / Total Shareholder Equity)
@@ -187,7 +209,7 @@ def _compute_financial_metrics(balance_sheet: pd.DataFrame, income_stmt: pd.Data
     cols_to_keep = [
         "symbol", "asOfDate", "EBIT", "InvestedCapital", "roic", "MarketCap",
         "CashAndCashEquivalents", "totalDebt", "preferredequity", "faustmannRatio",
-        "fcf", "fcfYield", "industry",
+        "opCashFlow", "opCashFlowYield", "industry", "EnterpriseValue",
         "NetIncome", "TotalShareholderEquity", "roe",
     ]
     # Some columns may be missing if upstream keys failed – drop those silently.
@@ -350,8 +372,21 @@ def process_universe(
                 delay_ref=delay_ref,
             )
 
+            valuation_all = fetch_with_backoff(
+                lambda: ticker.valuation_measures,
+                desc=f"batch valuation_measures {batch_label}",
+                delay_ref=delay_ref,
+            )
+            valuation_all = (
+                valuation_all.sort_values("asOfDate")
+                .groupby("symbol")
+                .tail(1)
+                .reset_index()
+            )
+
             details_df = pd.DataFrame.from_dict(details_dict).T
             profile_df = pd.DataFrame.from_dict(profile_dict).T
+            # valuation_all already tabular with symbol column
 
         except RateLimitExceeded as rl_exc:
             raise RateLimitExceeded(str(rl_exc), partial_df=df_accum) from rl_exc
@@ -376,9 +411,10 @@ def process_universe(
 
             details_row = details_df.loc[[symbol]] if symbol in details_df.index else pd.DataFrame()
             profile_row = profile_df.loc[[symbol]] if symbol in profile_df.index else pd.DataFrame()
+            val_row = valuation_all[valuation_all["symbol"] == symbol]
 
             try:
-                metrics_df = _compute_financial_metrics(bs_row, inc_row, cf_row, details_row, profile_row)
+                metrics_df = _compute_financial_metrics(bs_row, inc_row, cf_row, details_row, profile_row, val_row)
             except Exception as m_exc:
                 print(f"    · metric error {symbol}: {m_exc}")
                 retry.append(symbol)

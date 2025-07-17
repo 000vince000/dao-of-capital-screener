@@ -7,7 +7,7 @@ Steps:
 3. Run `normalized_austrian_screener.py` to refresh `normalized_austrian.csv`, with `austrian.csv` and `wacc_top.csv` as input.
 4. Sort `normalized_austrian.csv` by `sumRanks` ascending and pick the top *N* tickers (default 50).
 5. Call `compute_roic_slope.py` and `compute_roe_scope.py` for this subset.
-6. Compute "projectedReturn24Months" as FCF Yield+(ROIC−WACC)+2×slope, where slope is the slope of the ROIC if roeFlag is TRUE or ROE slope if roeFlag is FALSE
+6. Compute "projectedReturn24Months" as opCashFlowYield+excessReturn+2×slope, where slope is the slope of the ROIC if roeFlag is TRUE or ROE slope if roeFlag is FALSE
 7. Rank the whole list by projectedReturn24Months and sort as such.
 8. Merge the key metrics into a concise overview CSV (default: top50_overview.csv).
 
@@ -146,7 +146,7 @@ def main() -> None:
             "MarketCap",
             "sanitizedFaustmannRatio",
             "sumRanks",
-            "fcfYield",
+            "opCashFlowYield",
             "excessReturn",
             "excessReturnRank",
             "faustmannRank",
@@ -172,7 +172,7 @@ def main() -> None:
         merged["roeFlag"], merged.get("roeSlope"), merged.get("roicSlope")
     )
     merged["projectedReturn24Months"] = (
-        merged["fcfYield"] + merged["excessReturn"] + 2 * merged["normalizedSlope"]
+        merged["opCashFlowYield"] + merged["excessReturn"] + 2 * merged["normalizedSlope"]
     )
 
     # Select and reorder columns
@@ -187,7 +187,7 @@ def main() -> None:
         "excessReturnRank",
         "faustmannRank",
         "sumRanks",
-        "fcfYield",
+        "opCashFlowYield",
         "wacc",
         "costOfEquity",
         "roicSlope",
