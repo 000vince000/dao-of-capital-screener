@@ -7,7 +7,9 @@ Steps:
 3. Run `normalized_austrian_screener.py` to refresh `normalized_austrian.csv`, with `austrian.csv` and `wacc_top.csv` as input.
 4. Sort `normalized_austrian.csv` by `sumRanks` ascending and pick the top *N* tickers (default 50).
 5. Call `compute_roic_slope.py` and `compute_roe_scope.py` for this subset.
-6. Merge the key metrics into a concise overview CSV (default: top50_overview.csv).
+6. Compute "projectedReturn24Months" as FCF Yield+(ROIC−WACC)+2×slope, where slope is the slope of the ROIC if roeFlag is TRUE or ROE slope if roeFlag is FALSE
+7. Rank the whole list by projectedReturn24Months and sort as such.
+8. Merge the key metrics into a concise overview CSV (default: top50_overview.csv).
 
 This script assumes it is executed from the project root where the individual
 Python modules reside.
@@ -21,6 +23,7 @@ from pathlib import Path
 from typing import List
 
 import pandas as pd
+import numpy as np
 
 # --------------------------------------------------------------------------------------
 # CLI
@@ -119,6 +122,8 @@ def main() -> None:
     # 5. Load normalized CSV and pick top-N
     # ------------------------------------------------------------------
     norm_df = pd.read_csv("normalized_austrian.csv", sep=";")
+    if "faustmannRank" not in norm_df.columns and "sanitizedFaustmannRatio" in norm_df.columns:
+        norm_df["faustmannRank"] = norm_df["sanitizedFaustmannRatio"].rank(method="min", ascending=True)
     df_sorted = norm_df.sort_values("sumRanks", ascending=True)
     top_df = df_sorted.head(args.top)
     top_tickers = top_df["symbol"].dropna().astype(str).tolist()
@@ -143,6 +148,11 @@ def main() -> None:
             "sumRanks",
             "fcfYield",
             "excessReturn",
+            "excessReturnRank",
+            "faustmannRank",
+            "industry",
+            "roeFlag",
+            "roe",
         ]
     ]
 
@@ -152,10 +162,46 @@ def main() -> None:
     merged = (
         top_df[["symbol"]]  # ensure ordering of top tickers
         .merge(df_base_subset, on="symbol", how="left")
-        .merge(df_wacc[["symbol", "wacc"]], on="symbol", how="left")
+        .merge(df_wacc[["symbol", "wacc", "costOfEquity"]], on="symbol", how="left")
         .merge(df_roic_slope, on="symbol", how="left")
         .merge(df_roe_slope, on="symbol", how="left")
     )
+
+    # Compute projectedReturn24Months
+    merged["normalizedSlope"] = np.where(
+        merged["roeFlag"], merged.get("roeSlope"), merged.get("roicSlope")
+    )
+    merged["projectedReturn24Months"] = (
+        merged["fcfYield"] + merged["excessReturn"] + 2 * merged["normalizedSlope"]
+    )
+
+    # Select and reorder columns
+    cols_order = [
+        "symbol",
+        "industry",
+        "roeFlag",
+        "MarketCap",
+        "roic",
+        "roe",
+        "excessReturn",
+        "excessReturnRank",
+        "faustmannRank",
+        "sumRanks",
+        "fcfYield",
+        "wacc",
+        "costOfEquity",
+        "roicSlope",
+        "roeSlope",
+        "normalizedSlope",
+        "projectedReturn24Months",
+    ]
+    # Ensure all expected columns exist
+    for col in cols_order:
+        if col not in merged.columns:
+            merged[col] = np.nan
+    merged = merged[cols_order]
+
+    merged = merged.sort_values("projectedReturn24Months", ascending=False)
 
     merged.to_csv(args.output, sep=";", index=False)
     print(f"✓ Saved summary → {args.output.resolve()}")
