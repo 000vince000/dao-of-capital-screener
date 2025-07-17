@@ -147,11 +147,48 @@ def _compute_financial_metrics(balance_sheet: pd.DataFrame, income_stmt: pd.Data
     else:
         merged["fcfYield"] = pd.NA
 
+    # ------------------------------------------------------------------
+    # ROE computation (Net Income / Total Shareholder Equity)
+    # ------------------------------------------------------------------
+    net_income_col = next(
+        (c for c in [
+            "NetIncome",
+            "NetIncomeLoss",
+            "netIncome",
+        ] if c in merged.columns),
+        None,
+    )
+    equity_col = next(
+        (c for c in [
+            "TotalShareholderEquity",
+            "StockholdersEquity",
+            "totalStockholderEquity",
+        ] if c in merged.columns),
+        None,
+    )
+
+    # Standardize column names and compute ROE if possible
+    if net_income_col is not None:
+        merged = merged.rename(columns={net_income_col: "NetIncome"})
+    else:
+        merged["NetIncome"] = pd.NA
+
+    if equity_col is not None:
+        merged = merged.rename(columns={equity_col: "TotalShareholderEquity"})
+    else:
+        merged["TotalShareholderEquity"] = pd.NA
+
+    if net_income_col is not None and equity_col is not None:
+        merged["roe"] = merged["NetIncome"] / merged["TotalShareholderEquity"].replace(0, pd.NA)
+    else:
+        merged["roe"] = pd.NA
+
     # Keep only the relevant columns (mirrors the notebook's final selection)
     cols_to_keep = [
         "symbol", "asOfDate", "EBIT", "InvestedCapital", "roic", "MarketCap",
         "CashAndCashEquivalents", "totalDebt", "preferredequity", "faustmannRatio",
         "fcf", "fcfYield", "industry",
+        "NetIncome", "TotalShareholderEquity", "roe",
     ]
     # Some columns may be missing if upstream keys failed – drop those silently.
     existing_cols = [c for c in cols_to_keep if c in merged.columns]
