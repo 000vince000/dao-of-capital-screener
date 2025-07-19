@@ -21,10 +21,16 @@ import time
 import pickle
 from typing import List, Tuple
 
-import bs4 as bs  # BeautifulSoup4
 import pandas as pd
-import requests
 from yahooquery import Ticker
+
+# Centralised network helpers
+from data_fetch_utils import (
+    fetch_russell_1000_tickers,
+    fetch_with_backoff,
+    RateLimitExceeded,
+    BASE_DELAY_SEC,
+)
 
 # --------------------------------------------------------------------------------------
 # Constants & configuration
@@ -43,243 +49,116 @@ DEFAULT_RATE_LIMIT_SEC = 0.5
 DEFAULT_MAX_COUNT = 1000
 
 # --------------------------------------------------------------------------------------
-# Helper functions
+# Helper wrappers (scraping utilities moved to `data_fetch_utils`)
 # --------------------------------------------------------------------------------------
-
-def fetch_russell_1000_tickers(index_url: str = RUSSELL_1000_WIKI) -> List[str]:
-    """Scrape the Russell-1000 index page and return a cleaned, sorted list of tickers."""
-    resp = requests.get(index_url, timeout=30)
-    resp.raise_for_status()
-
-    soup = bs.BeautifulSoup(resp.text, "lxml")
-    table = soup.find("table", {"class": "wikitable sortable"})
-    if table is None:
-        raise RuntimeError("Unable to locate the Russell-1000 constituents table.")
-
-    tickers: List[str] = []
-    for row in table.find_all("tr")[1:]:  # skip header row
-        ticker_cell = row.find_all("td")[1]
-        ticker = ticker_cell.text.strip()
-        # Yahoo Finance expects dashes instead of dots for certain tickers (e.g. BRK.B)
-        tickers.append(ticker.replace(".", "-"))
-
-    tickers.sort()
-    return tickers
 
 
 def _compute_financial_metrics(balance_sheet: pd.DataFrame, income_stmt: pd.DataFrame, cash_flow: pd.DataFrame, details: pd.DataFrame, profile: pd.DataFrame, valuation: pd.DataFrame | None = None) -> pd.DataFrame:
-    """Merge all fragments and compute the screener metrics for a single symbol."""
-    # ------------------------------------------------------------------
-    # Merge pieces – resembles the logic in the original notebook.
-    # ------------------------------------------------------------------
-    merged = pd.merge(balance_sheet, income_stmt, on=["symbol"], how="inner", suffixes=("_bs", "_is"))
-    if merged.empty:
-        return merged  # return empty -> will be skipped by caller
+    """Orchestrate sub-steps to compute final metrics for a single symbol."""
 
-    # --------------------------------------------------------------
-    # Attach Operating Cash Flow (OpCF).
-    # If the cash-flow slice contains `OperatingCashFlow`, merge it as `opCashFlow`.
-    # Otherwise leave `opCashFlow` as missing (pd.NA).
-    # --------------------------------------------------------------
-    if not cash_flow.empty and "OperatingCashFlow" in cash_flow.columns:
-        ocf_df = (
-            cash_flow[["symbol", "OperatingCashFlow"]]
-            .rename(columns={"OperatingCashFlow": "opCashFlow"})
+    # ------------------------------------------------------------------
+    # Helper pipeline steps (defined inline for locality)
+    # ------------------------------------------------------------------
+
+    def _merge_core() -> pd.DataFrame:
+        core = pd.merge(balance_sheet, income_stmt, on=["symbol"], how="inner", suffixes=("_bs", "_is"))
+        return core
+
+    def _attach_op_cf(frame: pd.DataFrame) -> None:
+        if not cash_flow.empty and "OperatingCashFlow" in cash_flow.columns:
+            frame["opCashFlow"] = cash_flow.loc[cash_flow["symbol"].isin(frame["symbol"]), "OperatingCashFlow"].values
+        else:
+            frame["opCashFlow"] = pd.NA
+
+    def _attach_market_industry(frame: pd.DataFrame) -> None:
+        if not details.empty:
+            mc = details[["marketCap"]].rename(columns={"marketCap": "MarketCap"})
+            mc.index.name = "symbol"
+            frame.update(mc, overwrite=False)
+        if not profile.empty:
+            ind = profile[["industry"]]
+            frame.update(ind, overwrite=False)
+
+        # Normalize date column
+        if "asOfDate" not in frame.columns:
+            for alt in ("asOfDate_bs", "asOfDate_x", "asOfDate_is", "asOfDate_y"):
+                if alt in frame.columns:
+                    frame["asOfDate"] = frame[alt]
+                    break
+
+    def _compute_core_metrics(frame: pd.DataFrame) -> None:
+        frame["nopat"] = frame["EBIT"] * (1 - frame["TaxRateForCalcs"])
+        frame["roic"] = frame["nopat"] / frame["InvestedCapital"]
+
+        debt_cols = [
+            "CurrentDeferredLiabilities",
+            "LongTermDebtAndCapitalLeaseObligation",
+            "NonCurrentDeferredLiabilities",
+            "OtherNonCurrentLiabilities",
+        ]
+        for col in debt_cols:
+            if col not in frame.columns:
+                frame[col] = 0
+        frame["totalDebt"] = frame[debt_cols].fillna(0).sum(axis=1)
+
+        frame["preferredequity"] = frame.get("CapitalStock", 0) - frame.get("CommonStock", 0)
+
+        frame["networth"] = (
+            frame.get("InvestedCapital", 0) + frame.get("CashAndCashEquivalents", 0) - frame["totalDebt"] - frame["preferredequity"]
         )
-        merged = pd.merge(merged, ocf_df, on="symbol", how="left")
-    else:
-        merged["opCashFlow"] = pd.NA
+        frame["faustmannRatio"] = frame["MarketCap"] / frame["networth"]
 
-    market_cap = details[["marketCap"]].rename(columns={"marketCap": "MarketCap"})
-    market_cap.index.name = "symbol"
-    industry = profile[["industry"]]
+    def _attach_enterprise_value(frame: pd.DataFrame) -> None:
+        ev_val = pd.NA
+        if valuation is not None and not valuation.empty and "EnterpriseValue" in valuation.columns:
+            candidate = valuation["EnterpriseValue"].iloc[0]
+            if pd.notna(candidate):
+                ev_val = candidate
+        if pd.isna(ev_val):
+            ev_val = frame["MarketCap"] + frame["totalDebt"] + frame["preferredequity"] - frame.get("CashAndCashEquivalents", 0)
+        frame["EnterpriseValue"] = ev_val
+        frame["opCashFlowYield"] = frame["opCashFlow"] / frame["EnterpriseValue"]
 
-    merged = pd.merge(merged, market_cap, left_on="symbol", right_index=True, how="left")
-    merged = pd.merge(merged, industry, left_on="symbol", right_index=True, how="left")
+    def _compute_roe(frame: pd.DataFrame) -> None:
+        ni_col = next((c for c in ["NetIncome", "NetIncomeLoss", "netIncome"] if c in frame.columns), None)
+        eq_col = next((c for c in ["TotalShareholderEquity", "StockholdersEquity", "totalStockholderEquity"] if c in frame.columns), None)
+        if ni_col and eq_col:
+            frame["roe"] = frame[ni_col] / frame[eq_col].replace(0, pd.NA)
+            frame.rename(columns={ni_col: "NetIncome", eq_col: "TotalShareholderEquity"}, inplace=True)
+        else:
+            frame["roe"] = pd.NA
 
-    # Normalize date column
-    if "asOfDate" not in merged.columns:
-        for alt in ("asOfDate_bs", "asOfDate_x", "asOfDate_is", "asOfDate_y"):
-            if alt in merged.columns:
-                merged["asOfDate"] = merged[alt]
-                break
-
-    # Guarantee "symbol" is a proper column
-    if "symbol" not in merged.columns:
-        merged = merged.reset_index().rename(columns={"index": "symbol"})
+    def _validate_and_trim(frame: pd.DataFrame) -> pd.DataFrame:
+        cols_keep = [
+            "symbol", "asOfDate", "EBIT", "InvestedCapital", "roic", "MarketCap",
+            "CashAndCashEquivalents", "totalDebt", "preferredequity", "faustmannRatio",
+            "opCashFlow", "opCashFlowYield", "industry", "EnterpriseValue",
+            "NetIncome", "TotalShareholderEquity", "roe",
+        ]
+        existing = [c for c in cols_keep if c in frame.columns]
+        return frame[existing]
 
     # ------------------------------------------------------------------
-    # Derived columns – wrapped in try/except to avoid crashing on missing fields.
+    # Orchestrate
     # ------------------------------------------------------------------
+
+    merged = _merge_core()
+    if merged.empty:
+        return merged
+
     try:
-        merged["nopat"] = merged["EBIT"] * (1 - merged["TaxRateForCalcs"])
-        merged["roic"] = merged["nopat"] / merged["InvestedCapital"]
+        _attach_op_cf(merged)
+        _attach_market_industry(merged)
+        _compute_core_metrics(merged)
+        _attach_enterprise_value(merged)
+        _compute_roe(merged)
     except KeyError:
-        # Required columns unavailable – return empty to mark failure
         return pd.DataFrame()
 
-    # Row-wise debt aggregation
-    debt_cols = [
-        "CurrentDeferredLiabilities",
-        "LongTermDebtAndCapitalLeaseObligation",
-        "NonCurrentDeferredLiabilities",
-        "OtherNonCurrentLiabilities",
-    ]
-    for col in debt_cols:
-        if col not in merged.columns:
-            merged[col] = 0
-    merged["totalDebt"] = merged[debt_cols].fillna(0).sum(axis=1)
-
-    merged["preferredequity"] = (
-        merged.get("CapitalStock", 0) - merged.get("CommonStock", 0)
-    )
-
-    merged["networth"] = (
-        merged.get("InvestedCapital", 0)
-        + merged.get("CashAndCashEquivalents", 0)
-        - merged["totalDebt"]
-        - merged["preferredequity"]
-    )
-
-    merged["faustmannRatio"] = merged["MarketCap"] / merged["networth"]
-
-    # --------------------------------------------------------------
-    # Enterprise Value – prefer Yahoo's direct figure; otherwise compute
-    # manually:  EV = MarketCap + totalDebt + preferredequity - Cash
-    # --------------------------------------------------------------
-    ev_value = pd.NA
-    if valuation is not None and not valuation.empty and "EnterpriseValue" in valuation.columns:
-        ev_candidate = valuation["EnterpriseValue"].iloc[0]
-        if pd.notna(ev_candidate):
-            ev_value = ev_candidate
-
-    if pd.isna(ev_value):
-        ev_value = (
-            merged.get("MarketCap", pd.NA)
-            + merged.get("totalDebt", 0).fillna(0)
-            + merged.get("preferredequity", 0).fillna(0)
-            - merged.get("CashAndCashEquivalents", 0).fillna(0)
-        )
-
-    merged["EnterpriseValue"] = ev_value
-
-    # Operating Cash Flow yield relative to Enterprise Value
-    if "EnterpriseValue" in merged.columns:
-        merged["opCashFlowYield"] = merged["opCashFlow"] / merged["EnterpriseValue"]
-    else:
-        merged["opCashFlowYield"] = pd.NA
-
-    # ------------------------------------------------------------------
-    # ROE computation (Net Income / Total Shareholder Equity)
-    # ------------------------------------------------------------------
-    net_income_col = next(
-        (c for c in [
-            "NetIncome",
-            "NetIncomeLoss",
-            "netIncome",
-        ] if c in merged.columns),
-        None,
-    )
-    equity_col = next(
-        (c for c in [
-            "TotalShareholderEquity",
-            "StockholdersEquity",
-            "totalStockholderEquity",
-        ] if c in merged.columns),
-        None,
-    )
-
-    # Standardize column names and compute ROE if possible
-    if net_income_col is not None:
-        merged = merged.rename(columns={net_income_col: "NetIncome"})
-    else:
-        merged["NetIncome"] = pd.NA
-
-    if equity_col is not None:
-        merged = merged.rename(columns={equity_col: "TotalShareholderEquity"})
-    else:
-        merged["TotalShareholderEquity"] = pd.NA
-
-    if net_income_col is not None and equity_col is not None:
-        merged["roe"] = merged["NetIncome"] / merged["TotalShareholderEquity"].replace(0, pd.NA)
-    else:
-        merged["roe"] = pd.NA
-
-    # Keep only the relevant columns (mirrors the notebook's final selection)
-    cols_to_keep = [
-        "symbol", "asOfDate", "EBIT", "InvestedCapital", "roic", "MarketCap",
-        "CashAndCashEquivalents", "totalDebt", "preferredequity", "faustmannRatio",
-        "opCashFlow", "opCashFlowYield", "industry", "EnterpriseValue",
-        "NetIncome", "TotalShareholderEquity", "roe",
-    ]
-    # Some columns may be missing if upstream keys failed – drop those silently.
-    existing_cols = [c for c in cols_to_keep if c in merged.columns]
-    return merged[existing_cols]
+    return _validate_and_trim(merged)
 
 
-# --------------------------------------------------------------------------------------
-# Rate-limit handling utilities
-# --------------------------------------------------------------------------------------
-
-import requests
-
-BASE_DELAY_SEC = DEFAULT_RATE_LIMIT_SEC  # minimum pacing
-MAX_BACKOFF_SEC = 120                    # 2-minute ceiling
-
-
-class RateLimitExceeded(Exception):
-    """Raised when repeated 429 responses exhaust the allowed back-off budget."""
-
-    def __init__(self, message: str, partial_df: pd.DataFrame | None = None):
-        super().__init__(message)
-        self.partial_df = partial_df
-
-
-def _is_rate_limit_error(exc: Exception) -> bool:
-    """Heuristically decide whether *exc* is an HTTP-429 / rate-limit signal."""
-    if isinstance(exc, requests.exceptions.HTTPError):
-        try:
-            return exc.response is not None and exc.response.status_code == 429
-        except AttributeError:  # response may be mocked / missing
-            return False
-
-    # Fall-back to string inspection (yahooquery wraps errors in generic Exception)
-    return "429" in str(exc)
-
-
-def fetch_with_backoff(callable_fn, *, desc: str, delay_ref: list[float]):
-    """Execute *callable_fn* with exponential back-off on HTTP-429 errors.
-
-    Parameters
-    ----------
-    callable_fn : Callable[[], Any]
-        Zero-argument function performing the network request.
-    desc : str
-        Human-readable description for logging (e.g. "AAPL balance-sheet").
-    delay_ref : list[float]
-        Single-element list holding the current delay (mutable so callers share
-        state).
-    """
-    while True:
-        try:
-            return callable_fn()
-        except Exception as exc:  # noqa: BLE001 – blanket catch to inspect 429
-            if not _is_rate_limit_error(exc):
-                # Propagate non-rate-limit failures unchanged
-                raise
-
-            delay = delay_ref[0]
-            if delay >= MAX_BACKOFF_SEC:
-                raise RateLimitExceeded(
-                    f"Hit max back-off while retrieving {desc}") from exc
-
-            print(
-                f"  · 429 rate-limit on {desc}. Sleeping {delay} s (will double).",
-                flush=True,
-            )
-            time.sleep(delay)
-            delay_ref[0] = min(delay * 2, MAX_BACKOFF_SEC)
-            # Loop and retry
+# Rate-limit utilities are now imported from `data_fetch_utils`.
 
 
 def process_universe(
@@ -290,17 +169,107 @@ def process_universe(
     batch_size: int,
     processed: set[str],
 ) -> Tuple[pd.DataFrame, List[str]]:
-    """Iterate over *tickers* and aggregate the screener metrics.
+    """Iterate over *tickers* in batches and return (metrics_df, retry_list)."""
 
-    Returns
-    -------
-    result_df : DataFrame
-        Combined metrics for all tickers that were processed successfully.
-    retry_list : list[str]
-        Symbols that failed due to data availability issues and could be retried.
-    """
-    df_accum = pd.DataFrame()
-    retry: List[str] = []
+    # ------------------------------------------------------------------
+    # Nested helpers
+    # ------------------------------------------------------------------
+
+    def _fetch_batch_data(tck: Ticker, label: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        """Download and pre-filter all Yahoo slices for *tck* (a batch Ticker)."""
+
+        bs_q = fetch_with_backoff(
+            lambda: tck.balance_sheet(frequency="q"),
+            desc=f"batch balance-sheet {label}",
+            delay_ref=delay_ref,
+        )
+        bs_q = (
+            bs_q[bs_q["periodType"] == "3M"].sort_values("asOfDate").groupby("symbol").tail(1).reset_index()
+        )
+
+        inc_q = fetch_with_backoff(
+            lambda: tck.income_statement(frequency="q"),
+            desc=f"batch income-statement {label}",
+            delay_ref=delay_ref,
+        )
+        inc_q = (
+            inc_q[inc_q["periodType"] == "TTM"].sort_values("asOfDate").groupby("symbol").tail(1).reset_index()
+        )
+
+        cf_q = fetch_with_backoff(
+            lambda: tck.cash_flow(frequency="q"),
+            desc=f"batch cash-flow {label}",
+            delay_ref=delay_ref,
+        )
+        cf_q = (
+            cf_q[cf_q["periodType"] == "TTM"].sort_values("asOfDate").groupby("symbol").tail(1).reset_index()
+        )
+
+        details_dict = fetch_with_backoff(
+            lambda: tck.summary_detail,
+            desc=f"batch summary_detail {label}",
+            delay_ref=delay_ref,
+        )
+        profile_dict = fetch_with_backoff(
+            lambda: tck.summary_profile,
+            desc=f"batch summary_profile {label}",
+            delay_ref=delay_ref,
+        )
+
+        valuation_all = fetch_with_backoff(
+            lambda: tck.valuation_measures,
+            desc=f"batch valuation_measures {label}",
+            delay_ref=delay_ref,
+        )
+        valuation_all = valuation_all.sort_values("asOfDate").groupby("symbol").tail(1).reset_index()
+
+        details_df = pd.DataFrame.from_dict(details_dict).T
+        profile_df = pd.DataFrame.from_dict(profile_dict).T
+
+        return bs_q, inc_q, cf_q, details_df, profile_df, valuation_all
+
+    def _process_symbols(batch_syms: list[str], dfs: tuple[pd.DataFrame, ...]) -> tuple[pd.DataFrame, list[str]]:
+        """Build metrics for each symbol in *batch_syms* using pre-fetched DataFrames."""
+        bs_q, inc_q, cf_q, details_df, profile_df, valuation_all = dfs
+        batch_out = pd.DataFrame()
+        batch_retry: list[str] = []
+
+        for sym in batch_syms:
+            processed.add(sym)
+
+            bs_row = bs_q[bs_q["symbol"] == sym]
+            inc_row = inc_q[inc_q["symbol"] == sym]
+            cf_row = cf_q[cf_q["symbol"] == sym]
+
+            if bs_row.empty or inc_row.empty:
+                batch_retry.append(sym)
+                continue
+
+            det_row = details_df.loc[[sym]] if sym in details_df.index else pd.DataFrame()
+            prof_row = profile_df.loc[[sym]] if sym in profile_df.index else pd.DataFrame()
+            val_row = valuation_all[valuation_all["symbol"] == sym]
+
+            try:
+                metrics_df = _compute_financial_metrics(bs_row, inc_row, cf_row, det_row, prof_row, val_row)
+            except Exception as err:
+                print(f"    · metric error {sym}: {err}")
+                batch_retry.append(sym)
+                continue
+
+            if metrics_df.empty:
+                batch_retry.append(sym)
+                continue
+
+            batch_out = pd.concat([batch_out, metrics_df])
+
+        return batch_out, batch_retry
+
+    # ------------------------------------------------------------------
+    # Main batching loop
+    # ------------------------------------------------------------------
+
+    overall_df = pd.DataFrame()
+    overall_retry: list[str] = []
 
     subset = tickers[:max_count]
     total = len(subset)
@@ -309,130 +278,32 @@ def process_universe(
         batch = [s for s in subset[batch_start : batch_start + batch_size] if s not in processed]
         if not batch:
             continue
-        batch_label = f"{batch_start + 1}-{batch_start + len(batch)}"
 
-        print(f"[Batch {batch_label}/{total}] Processing {len(batch)} symbols…", flush=True)
+        label = f"{batch_start + 1}-{batch_start + len(batch)}"
+        print(f"[Batch {label}/{total}] Processing {len(batch)} symbols…", flush=True)
 
         initial_delay = delay_ref[0]
-        time.sleep(delay_ref[0])  # respect current pacing
+        time.sleep(delay_ref[0])
 
         try:
-            ticker = Ticker(batch, asynchronous=False)
-
-            # --------------------------------------------------------------
-            # Bulk data retrieval with back-off protection
-            # --------------------------------------------------------------
-            bs_q_all = fetch_with_backoff(
-                lambda: ticker.balance_sheet(frequency="q"),
-                desc=f"batch balance-sheet {batch_label}",
-                delay_ref=delay_ref,
-            )
-            bs_q_all = (
-                bs_q_all[bs_q_all["periodType"] == "3M"]
-                .sort_values("asOfDate")
-                .groupby("symbol")
-                .tail(1)
-                .reset_index()
-            )
-
-            inc_q_all = fetch_with_backoff(
-                lambda: ticker.income_statement(frequency="q"),
-                desc=f"batch income-statement {batch_label}",
-                delay_ref=delay_ref,
-            )
-            inc_q_all = (
-                inc_q_all[inc_q_all["periodType"] == "TTM"]
-                .sort_values("asOfDate")
-                .groupby("symbol")
-                .tail(1)
-                .reset_index()
-            )
-
-            cf_q_all = fetch_with_backoff(
-                lambda: ticker.cash_flow(frequency="q"),
-                desc=f"batch cash-flow {batch_label}",
-                delay_ref=delay_ref,
-            )
-            cf_q_all = (
-                cf_q_all[cf_q_all["periodType"] == "TTM"]
-                .sort_values("asOfDate")
-                .groupby("symbol")
-                .tail(1)
-                .reset_index()
-            )
-
-            details_dict = fetch_with_backoff(
-                lambda: ticker.summary_detail,
-                desc=f"batch summary_detail {batch_label}",
-                delay_ref=delay_ref,
-            )
-            profile_dict = fetch_with_backoff(
-                lambda: ticker.summary_profile,
-                desc=f"batch summary_profile {batch_label}",
-                delay_ref=delay_ref,
-            )
-
-            valuation_all = fetch_with_backoff(
-                lambda: ticker.valuation_measures,
-                desc=f"batch valuation_measures {batch_label}",
-                delay_ref=delay_ref,
-            )
-            valuation_all = (
-                valuation_all.sort_values("asOfDate")
-                .groupby("symbol")
-                .tail(1)
-                .reset_index()
-            )
-
-            details_df = pd.DataFrame.from_dict(details_dict).T
-            profile_df = pd.DataFrame.from_dict(profile_dict).T
-            # valuation_all already tabular with symbol column
-
-        except RateLimitExceeded as rl_exc:
-            raise RateLimitExceeded(str(rl_exc), partial_df=df_accum) from rl_exc
+            t = Ticker(batch, asynchronous=False)
+            batch_dfs = _fetch_batch_data(t, label)
+        except RateLimitExceeded as exc:
+            raise RateLimitExceeded(str(exc), partial_df=overall_df) from exc
         except Exception as exc:
             print(f"  · batch data error: {exc}")
-            retry.extend(batch)
+            overall_retry.extend(batch)
             continue
 
-        # --------------------------------------------------------------
-        # Per-symbol metric computation within the batch
-        # --------------------------------------------------------------
-        for symbol in batch:
-            processed.add(symbol)  # mark so retry pass won't repeat
+        df_batch, retry_batch = _process_symbols(batch, batch_dfs)
+        overall_df = pd.concat([overall_df, df_batch])
+        overall_retry.extend(retry_batch)
 
-            bs_row = bs_q_all[bs_q_all["symbol"] == symbol]
-            inc_row = inc_q_all[inc_q_all["symbol"] == symbol]
-            cf_row = cf_q_all[cf_q_all["symbol"] == symbol]
-
-            if bs_row.empty or inc_row.empty:
-                retry.append(symbol)
-                continue
-
-            details_row = details_df.loc[[symbol]] if symbol in details_df.index else pd.DataFrame()
-            profile_row = profile_df.loc[[symbol]] if symbol in profile_df.index else pd.DataFrame()
-            val_row = valuation_all[valuation_all["symbol"] == symbol]
-
-            try:
-                metrics_df = _compute_financial_metrics(bs_row, inc_row, cf_row, details_row, profile_row, val_row)
-            except Exception as m_exc:
-                print(f"    · metric error {symbol}: {m_exc}")
-                retry.append(symbol)
-                continue
-
-            if metrics_df.empty:
-                retry.append(symbol)
-                continue
-
-            df_accum = pd.concat([df_accum, metrics_df])
-
-        # ------------------------------------------
-        # Back-trace delay if it had increased
-        # ------------------------------------------
+        # ---------- adjust delay back down if possible ----------
         if delay_ref[0] > initial_delay:
             delay_ref[0] = max(BASE_DELAY_SEC, delay_ref[0] / 4)
 
-    return df_accum, retry
+    return overall_df, overall_retry
 
 
 # --------------------------------------------------------------------------------------
