@@ -6,10 +6,9 @@ Steps:
 2. Run `fetch_wacc.py` to refresh `wacc_top.csv`, with `austrian.csv` as input.
 3. Run `normalized_austrian_screener.py` to refresh `normalized_austrian.csv`, with `austrian.csv` and `wacc_top.csv` as input.
 4. Sort `normalized_austrian.csv` by `sumRanks` ascending and pick the top *N* tickers (default 50).
-5. Call `compute_roic_slope.py` and `compute_roe_scope.py` for this subset.
-6. Compute "projectedReturn24Months" as opCashFlowYield+excessReturn+2×slope, where slope is the slope of the ROIC if roeFlag is TRUE or ROE slope if roeFlag is FALSE
-7. Rank the whole list by projectedReturn24Months and sort as such.
-8. Merge the key metrics into a concise overview CSV (default: top50_overview.csv).
+5. Compute "projectedReturn24Months" as Value Anchor + Quality Spread, with a Growth Gate
+6. Rank the whole list by projectedReturn24Months and sort as such.
+7. Merge the key metrics into a concise overview CSV (default: top50_overview.csv).
 
 This script assumes it is executed from the project root where the individual
 Python modules reside.
