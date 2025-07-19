@@ -103,10 +103,7 @@ def _compute_financial_metrics(balance_sheet: pd.DataFrame, income_stmt: pd.Data
 
         frame["preferredequity"] = frame.get("CapitalStock", 0) - frame.get("CommonStock", 0)
 
-        frame["networth"] = (
-            frame.get("InvestedCapital", 0) + frame.get("CashAndCashEquivalents", 0) - frame["totalDebt"] - frame["preferredequity"]
-        )
-        frame["faustmannRatio"] = frame["MarketCap"] / frame["networth"]
+        # Net worth and Faustmann ratio removed per latest spec.
 
     def _attach_enterprise_value(frame: pd.DataFrame) -> None:
         ev_val = pd.NA
@@ -131,7 +128,7 @@ def _compute_financial_metrics(balance_sheet: pd.DataFrame, income_stmt: pd.Data
     def _validate_and_trim(frame: pd.DataFrame) -> pd.DataFrame:
         cols_keep = [
             "symbol", "asOfDate", "EBIT", "InvestedCapital", "roic", "MarketCap",
-            "CashAndCashEquivalents", "totalDebt", "preferredequity", "faustmannRatio",
+            "CashAndCashEquivalents", "totalDebt", "preferredequity",
             "opCashFlow", "opCashFlowYield", "industry", "EnterpriseValue",
             "NetIncome", "TotalShareholderEquity", "roe",
         ]
