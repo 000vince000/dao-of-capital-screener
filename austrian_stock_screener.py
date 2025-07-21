@@ -7,8 +7,7 @@ High-level workflow
 1. Scrape a list of tickers (Russell-1000 constituents by default).
 2. For every ticker collect the most recent quarterly balance-sheet and income-statement
    plus market-cap and industry information using the `yahooquery` package.
-3. Compute derived metrics (NOPAT, ROIC, debt, preferred equity, net-worth,
-   Faustmann ratio).
+3. Compute derived metrics (NOPAT, ROIC, debt, preferred equity, net-worth).
 4. Persist the combined dataframe as CSV.
 
 Run `python austrian_stock_screener.py --help` for usage instructions.
