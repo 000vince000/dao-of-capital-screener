@@ -165,6 +165,24 @@ def main() -> None:
     if len(baseline_cols) > 1:  # Only merge if we have additional columns
         merged = merged.merge(baseline_df[baseline_cols], on="symbol", how="left")
 
+        # ------------------------------------------------------------------
+        # Consolidate potential duplicate columns created by the merge
+        # (e.g. industry_x / industry_y). Prefer values from the original
+        # normalized file but fall back to baseline data when missing.
+        # ------------------------------------------------------------------
+        def _consolidate(col: str):
+            x, y = f"{col}_x", f"{col}_y"
+            if x in merged.columns and y in merged.columns:
+                merged[col] = merged[x].combine_first(merged[y])
+                merged.drop(columns=[x, y], inplace=True)
+            elif x in merged.columns:
+                merged.rename(columns={x: col}, inplace=True)
+            elif y in merged.columns:
+                merged.rename(columns={y: col}, inplace=True)
+
+        for _c in ("industry", "MarketCap"):
+            _consolidate(_c)
+
     # Select and reorder columns
     cols_order = [
         "symbol",
