@@ -23,8 +23,12 @@ ROE_RELYING_INDUSTRIES: List[str] = [
     "Insurance - Specialty",
     "Insurance Brokers",
     
-    # Credit/Financial Services
+    # Credit/Financial Services & Banking
     "Credit Services",
+    "Banks - Diversified",
+    "Banks - Regional",
+    "Capital Markets",
+    "Mortgage Finance",
     
     # REITs (Real Estate Investment Trusts)
     "REIT - Diversified",
