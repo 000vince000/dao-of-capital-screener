@@ -2,10 +2,10 @@
 """Pipeline driver that orchestrates the full screening workflow.
 
 Steps:
-1. Run `current_baseline_data.py` to refresh `austrian.csv`.
-2. Run `fetch_wacc.py` to refresh `wacc_top.csv`, with `austrian.csv` as input.
-3. Run `normalized_austrian_screener.py` to refresh `normalized_austrian.csv`, with `austrian.csv` and `wacc_top.csv` as input.
-4. Sort `normalized_austrian.csv` by `sumRanks` ascending and pick the top *N* tickers (default 50).
+1. Run `current_baseline_data.py` to refresh `current_baseline_data.csv`.
+2. Run `fetch_wacc.py` to refresh `wacc_top.csv`, with `current_baseline_data.csv` as input.
+3. Run `normalized_austrian_screener.py` to refresh `normalized_austrian.csv`, with `current_baseline_data.csv` and `wacc_top.csv` as input.
+4. Sort `normalized_austrian.csv` by `rankingScore` ascending and pick the top *N* tickers (default 50).
 5. Compute "projectedReturn24Months" as Value Anchor + Quality Spread, with a Growth Gate
 6. Rank the whole list by projectedReturn24Months and sort as such.
 7. Merge the key metrics into a concise overview CSV (default: top50_overview.csv).
@@ -75,30 +75,24 @@ def _run_script(script: str, *args: str):
 def main() -> None:
     args = _parse_args()
 
-    austrian_csv = PROJECT_ROOT / "austrian.csv"
-
+    current_baseline_data_csv = PROJECT_ROOT / "current_baseline_data.csv"
     # ------------------------------------------------------------------
     # 1. Run the screener (unless skipped)
     # ------------------------------------------------------------------
-    if not args.skip_screener or not austrian_csv.exists():
+    if not args.skip_screener or not current_baseline_data_csv.exists():
         _run_script("current_baseline_data.py")
     else:
-        print("✓ Skipping screener step – austrian.csv already present.")
+        print("✓ Skipping screener step – current_baseline_data.csv already present.")
 
-    if not austrian_csv.exists():
-        print("❌ Expected austrian.csv was not created.", file=sys.stderr)
+    if not current_baseline_data_csv.exists():
+        print("❌ Expected current_baseline_data.csv was not created.", file=sys.stderr)
         sys.exit(1)
 
     # ------------------------------------------------------------------
     # 2. Pick top-N tickers by sumRanks
     # ------------------------------------------------------------------
-    df_base = pd.read_csv(austrian_csv, sep=";")
-    if "sumRanks" not in df_base.columns:
-        print("❌ Column 'sumRanks' not found in austrian.csv", file=sys.stderr)
-        sys.exit(1)
-
-    df_sorted = df_base.sort_values("sumRanks", ascending=True)
-    top_df = df_sorted.head(args.top)
+    df_base = pd.read_csv(current_baseline_data_csv, sep=";")
+    
     top_tickers: List[str] = top_df["symbol"].dropna().astype(str).tolist()
 
     if not top_tickers:
@@ -110,12 +104,12 @@ def main() -> None:
     # ------------------------------------------------------------------
     # 3. Refresh WACC for entire universe before ranking normalization
     # ------------------------------------------------------------------
-    _run_script("fetch_wacc.py", "--input", str(austrian_csv), "--output", "wacc_top.csv")
+    _run_script("fetch_wacc.py", "--input", str(current_baseline_data_csv), "--output", "wacc_top.csv")
 
     # ------------------------------------------------------------------
     # 4. Produce normalized screener with excess returns
     # ------------------------------------------------------------------
-    _run_script("normalized_austrian_screener.py", "--input", str(austrian_csv), "--wacc-file", "wacc_top.csv", "--output", "normalized_austrian.csv")
+    _run_script("normalized_austrian_screener.py", "--input", str(current_baseline_data_csv), "--wacc-file", "wacc_top.csv", "--output", "normalized_austrian.csv")
 
     # ------------------------------------------------------------------
     # 5. Load normalized CSV and pick top-N

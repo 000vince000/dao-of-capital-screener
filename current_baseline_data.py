@@ -7,8 +7,10 @@ High-level workflow
 1. Scrape a list of tickers (Russell-1000 constituents by default).
 2. For every ticker collect the most recent quarterly balance-sheet and income-statement
    plus market-cap and industry information using the `yahooquery` package.
-3. Compute derived metrics (NOPAT, ROIC, debt, preferred equity, net-worth).
-4. Persist the combined dataframe as CSV.
+3. Filter out tickers from industries that rely on ROE (asset management, insurance,
+   REITs, utilities, oil & gas midstream) to focus on operating businesses.
+4. Compute derived metrics (NOPAT, ROIC, debt, preferred equity, value metrics).
+5. Persist the combined dataframe as CSV.
 
 Run `python current_baseline_data.py --help` for usage instructions.
 """
@@ -147,12 +149,16 @@ def _compute_financial_metrics(balance_sheet: pd.DataFrame, income_stmt: pd.Data
         else:
             frame["roe"] = pd.NA
 
+    # value metric = EBIT / EnterpriseValue
+    def _compute_value_metrics(frame: pd.DataFrame) -> None:
+        frame["valueMetric"] = frame["EBIT"] / frame["EnterpriseValue"]
+
     def _validate_and_trim(frame: pd.DataFrame) -> pd.DataFrame:
         cols_keep = [
             "symbol", "asOfDate", "EBIT", "InvestedCapital", "roic", "MarketCap",
             "CashAndCashEquivalents", "totalDebt", "preferredequity",
             "opCashFlow", "opCashFlowYield", "industry", "EnterpriseValue",
-            "NetIncome", "TotalShareholderEquity", "roe",
+            "NetIncome", "TotalShareholderEquity", "roe", "valueMetric",
         ]
         existing = [c for c in cols_keep if c in frame.columns]
         return frame[existing]
@@ -171,6 +177,7 @@ def _compute_financial_metrics(balance_sheet: pd.DataFrame, income_stmt: pd.Data
         _compute_core_metrics(merged)
         _attach_enterprise_value(merged)
         _compute_roe(merged)
+        _compute_value_metrics(merged)
     except KeyError:
         return pd.DataFrame()
 
@@ -341,8 +348,8 @@ def main() -> None:
     parser.add_argument(
         "--output",
         type=pathlib.Path,
-        default=pathlib.Path("austrian.csv"),
-        help="Destination CSV filename (default: ./austrian.csv)",
+        default=pathlib.Path("current_baseline_data.csv"),
+        help="Destination CSV filename (default: ./current_baseline_data.csv)",
     )
     parser.add_argument(
         "--max-count",
