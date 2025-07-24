@@ -47,6 +47,29 @@ DEFAULT_RATE_LIMIT_SEC = 0.5
 # 1,000 which equals the full Russell-1000 universe. You can override this via CLI.
 DEFAULT_MAX_COUNT = 1000
 
+DEFAULT_INDUSTRIES_RELYING_ON_ROE: List[str] = [
+    "Asset Management",
+    "Insurance - Diversified",
+    "Insurance - Life",
+    "Insurance - Property & Casualty",
+    "Insurance - Specialty",
+    "Insurance Brokers",
+    "Credit Services",
+    "REIT - Diversified",
+    "REIT - Residential",
+    "REIT - Office",
+    "REIT - Retail",
+    "REIT - Industrial",
+    "REIT - Specialty",
+    "REIT - Mortgage",
+    "REIT - Healthcare Facilities",
+    "REIT - Hotel & Motel",
+    "Utilities - Regulated Electric",
+    "Utilities - Regulated Gas",
+    "Utilities - Regulated Water",
+    "Utilities - Diversified",
+    "Oil & Gas Midstream",
+]
 # --------------------------------------------------------------------------------------
 # Helper wrappers (scraping utilities moved to `data_fetch_utils`)
 # --------------------------------------------------------------------------------------
@@ -233,6 +256,13 @@ def process_universe(
         for sym in batch_syms:
             processed.add(sym)
 
+            # Early filter: skip if industry relies on ROE
+            if sym in profile_df.index:
+                industry = profile_df.loc[sym].get("industry", "")
+                if industry in DEFAULT_INDUSTRIES_RELYING_ON_ROE:
+                    print(f"    · skipping {sym} (ROE-relying industry: {industry})")
+                    continue
+
             bs_row = bs_q[bs_q["symbol"] == sym]
             inc_row = inc_q[inc_q["symbol"] == sym]
             cf_row = cf_q[cf_q["symbol"] == sym]
@@ -414,38 +444,15 @@ def main() -> None:
             print(f"⚠️  Still failed for {len(retry2)} tickers: {', '.join(retry2[:10])}{' …' if len(retry2)>10 else ''}")
 
     # --------------------------------------------------------------
-    # Finalize dataframe: rankings and sanitized ratio
+    # Finalize and save dataframe
     # --------------------------------------------------------------
-    def _add_rankings(frame: pd.DataFrame) -> pd.DataFrame:
-        tmp = frame.copy()
-        # Sanitize faustmannRatio (negative → NaN)
-        if "faustmannRatio" in tmp.columns:
-            tmp["sanitizedFaustmannRatio"] = tmp["faustmannRatio"].where(tmp["faustmannRatio"] >= 0)
-        else:
-            tmp["sanitizedFaustmannRatio"] = pd.NA
-
-        # ROIC rank high→low (1 = best)
-        if "roic" in tmp.columns:
-            tmp["roicRank"] = tmp["roic"].rank(method="min", ascending=False)
-        else:
-            tmp["roicRank"] = pd.NA
-
-        # Faustmann rank low→high (1 = best)
-        tmp["faustmannRank"] = tmp["sanitizedFaustmannRatio"].rank(method="min", ascending=True)
-
-        # Sum ranks (skip rows with NaNs)
-        tmp["sumRanks"] = tmp[["roicRank", "faustmannRank"]].sum(axis=1, min_count=2)
-        return tmp
-
     if existing_df is not None:
         combined = pd.concat([existing_df, df], ignore_index=True)
         if "symbol" in combined.columns:
             combined = combined.drop_duplicates(subset="symbol", keep="first")
-        final_df = _add_rankings(combined)
-        final_df.to_csv(args.output, sep=";", index=False)
+        combined.to_csv(args.output, sep=";", index=False)
     else:
-        final_df = _add_rankings(df)
-        final_df.to_csv(args.output, sep=";", index=False)
+        df.to_csv(args.output, sep=";", index=False)
     print(f"Saved results → {args.output.resolve()}")
 
 

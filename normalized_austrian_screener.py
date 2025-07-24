@@ -26,38 +26,12 @@ from __future__ import annotations
 import argparse
 import pathlib
 import sys
-from typing import List
 
-import numpy as np
 import pandas as pd
 
 # --------------------------------------------------------------------------------------
 # Constants
 # --------------------------------------------------------------------------------------
-
-_DEFAULT_INDUSTRIES_RELYING_ON_ROE: List[str] = [
-    "Asset Management",
-    "Insurance - Diversified",
-    "Insurance - Life",
-    "Insurance - Property & Casualty",
-    "Insurance - Specialty",
-    "Insurance Brokers",
-    "Credit Services",
-    "REIT - Diversified",
-    "REIT - Residential",
-    "REIT - Office",
-    "REIT - Retail",
-    "REIT - Industrial",
-    "REIT - Specialty",
-    "REIT - Mortgage",
-    "REIT - Healthcare Facilities",
-    "REIT - Hotel & Motel",
-    "Utilities - Regulated Electric",
-    "Utilities - Regulated Gas",
-    "Utilities - Regulated Water",
-    "Utilities - Diversified",
-    "Oil & Gas Midstream",
-]
 
 # --------------------------------------------------------------------------------------
 # Helpers
@@ -93,26 +67,15 @@ def main() -> None:
     # Drop columns if present
     df = df.drop(columns=[c for c in ["roicRank", "sumRanks"] if c in df.columns], errors="ignore")
 
-    # roeFlag
-    df["roeFlag"] = df["industry"].isin(_DEFAULT_INDUSTRIES_RELYING_ON_ROE)
-
     # Merge WACC data
     wacc_df = pd.read_csv(args.wacc_file, sep=";")
     df = df.merge(wacc_df[["symbol", "wacc", "costOfEquity"]], on="symbol", how="left")
 
     # Compute excessReturn
-    roe_term = df["roe"] - df["costOfEquity"]
-    roic_term = df["roic"] - df["wacc"]
-    df["excessReturn"] = np.where(df["roeFlag"], roe_term, roic_term)
+    df["excessReturn"] = df["roic"] - df["wacc"]
 
     # Rank excessReturn descending (1 = best). Handle NaNs → rank NaN as worst (use pct?). We'll set method='min', na_option='bottom'
     df["excessReturnRank"] = df["excessReturn"].rank(method="min", ascending=False, na_option="bottom")
-
-    # sumRanks
-    if "faustmannRank" in df.columns:
-        df["sumRanks"] = df["excessReturnRank"] + df["faustmannRank"]
-    else:
-        df["sumRanks"] = df["excessReturnRank"]
 
     df.to_csv(args.output, sep=";", index=False)
     print(f"✓ Saved normalized screener → {args.output.resolve()}")
