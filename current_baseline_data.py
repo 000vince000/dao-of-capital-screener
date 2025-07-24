@@ -158,7 +158,7 @@ def _compute_financial_metrics(balance_sheet: pd.DataFrame, income_stmt: pd.Data
             "symbol", "asOfDate", "EBIT", "InvestedCapital", "roic", "MarketCap",
             "CashAndCashEquivalents", "totalDebt", "preferredequity",
             "opCashFlow", "opCashFlowYield", "industry", "EnterpriseValue",
-            "NetIncome", "TotalShareholderEquity", "roe", "valueMetric",
+            "NetIncome", "TotalShareholderEquity", "roe", "valueMetric", "nopat",
         ]
         existing = [c for c in cols_keep if c in frame.columns]
         return frame[existing]

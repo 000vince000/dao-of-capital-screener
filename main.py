@@ -6,9 +6,10 @@ Steps:
 2. Run `fetch_wacc.py` to refresh `wacc_top.csv`, with `current_baseline_data.csv` as input.
 3. Run `normalized_austrian_screener.py` to refresh `normalized_austrian.csv`, with `current_baseline_data.csv` and `wacc_top.csv` as input.
 4. Sort `normalized_austrian.csv` by `rankingScore` ascending and pick the top *N* tickers (default 50).
-5. Compute "projectedReturn24Months" as Value Anchor + Quality Spread, with a Growth Gate
-6. Rank the whole list by projectedReturn24Months and sort as such.
-7. Merge the key metrics into a concise overview CSV (default: top50_overview.csv).
+5. Run `compute_roiic.py` to refresh `roiic_top.csv`, with `normalized_austrian.csv` as input.
+6. Compute "projectedReturn24Months" as Value Anchor + Quality Spread, with a Growth Gate
+7. Rank the whole list by projectedReturn24Months and sort as such.
+8. Merge the key metrics into a concise overview CSV (default: top50_overview.csv)
 
 This script assumes it is executed from the project root where the individual
 Python modules reside.
