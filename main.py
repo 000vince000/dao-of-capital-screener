@@ -103,12 +103,20 @@ def main() -> None:
     # ------------------------------------------------------------------
     # 3. Refresh WACC for entire universe before ranking normalization
     # ------------------------------------------------------------------
-    _run_script("fetch_wacc.py", "--input", str(current_baseline_data_csv), "--output", "wacc_top.csv")
+    wacc_csv = PROJECT_ROOT / "wacc_top.csv"
+    if not wacc_csv.exists():
+        _run_script("fetch_wacc.py", "--input", str(current_baseline_data_csv), "--output", "wacc_top.csv")
+    else:
+        print("✓ Skipping WACC fetch – wacc_top.csv already exists.")
 
     # ------------------------------------------------------------------
     # 4. Produce normalized screener with excess returns
     # ------------------------------------------------------------------
-    _run_script("normalized_austrian_screener.py", "--input", str(current_baseline_data_csv), "--wacc-file", "wacc_top.csv", "--output", "normalized_austrian.csv")
+    normalized_csv = PROJECT_ROOT / "normalized_austrian.csv"
+    if not normalized_csv.exists():
+        _run_script("normalized_austrian_screener.py", "--input", str(current_baseline_data_csv), "--wacc-file", "wacc_top.csv", "--output", "normalized_austrian.csv")
+    else:
+        print("✓ Skipping normalized screener – normalized_austrian.csv already exists.")
 
     # ------------------------------------------------------------------
     # 5. Load normalized CSV and pick top-N
@@ -123,7 +131,11 @@ def main() -> None:
     # ------------------------------------------------------------------
     # 6. Compute ROIIC for the full normalized dataset  
     # ------------------------------------------------------------------
-    _run_script("compute_roiic.py", "--input", "normalized_austrian.csv", "--output", "roiic_top.csv")
+    roiic_csv = PROJECT_ROOT / "roiic_top.csv"
+    if not roiic_csv.exists():
+        _run_script("compute_roiic.py", "--input", "normalized_austrian.csv", "--output", "roiic_top.csv")
+    else:
+        print("✓ Skipping ROIIC computation – roiic_top.csv already exists.")
 
     # ------------------------------------------------------------------
     # 7. Merge selected metrics into summary CSV
@@ -138,11 +150,28 @@ def main() -> None:
     if "wacc" in merged.columns and "roiic" in merged.columns:
         merged["growthGate"] = merged["roiic"] - merged["wacc"]
 
+    # Merge with baseline data to get missing columns (industry, MarketCap)
+    # Note: EBIT and EnterpriseValue are already in normalized_austrian.csv
+    baseline_df = pd.read_csv(current_baseline_data_csv, sep=";")
+    
+    # Only include columns that actually exist in baseline data and are missing from merged
+    baseline_cols = ["symbol"]
+    missing_cols = ["industry", "MarketCap"]  # These should be added to baseline data
+    for col in missing_cols:
+        if col in baseline_df.columns:
+            baseline_cols.append(col)
+    
+    # Merge with baseline data for missing columns
+    if len(baseline_cols) > 1:  # Only merge if we have additional columns
+        merged = merged.merge(baseline_df[baseline_cols], on="symbol", how="left")
+
     # Select and reorder columns
     cols_order = [
         "symbol",
-        "industry",
+        "industry", 
         "MarketCap",
+        "EBIT",
+        "EnterpriseValue",
         "roic",        
         "wacc",
         "roiic",

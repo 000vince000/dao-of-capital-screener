@@ -82,13 +82,17 @@ def _compute_financial_metrics(balance_sheet: pd.DataFrame, income_stmt: pd.Data
             frame["opCashFlow"] = pd.NA
 
     def _attach_market_industry(frame: pd.DataFrame) -> None:
-        if not details.empty:
-            mc = details[["marketCap"]].rename(columns={"marketCap": "MarketCap"})
-            mc.index.name = "symbol"
-            frame.update(mc, overwrite=False)
-        if not profile.empty:
-            ind = profile[["industry"]]
-            frame.update(ind, overwrite=False)
+        # Add MarketCap from details
+        if not details.empty and "marketCap" in details.columns:
+            for symbol in frame["symbol"]:
+                if symbol in details.index:
+                    frame.loc[frame["symbol"] == symbol, "MarketCap"] = details.loc[symbol, "marketCap"]
+        
+        # Add industry from profile  
+        if not profile.empty and "industry" in profile.columns:
+            for symbol in frame["symbol"]:
+                if symbol in profile.index:
+                    frame.loc[frame["symbol"] == symbol, "industry"] = profile.loc[symbol, "industry"]
 
         # Normalize date column
         if "asOfDate" not in frame.columns:
