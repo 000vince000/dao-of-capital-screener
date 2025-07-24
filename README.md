@@ -18,12 +18,12 @@ The WACC scraper (`fetch_wacc.py`) depends on `requests` and `beautifulsoup4`, b
 Run the screener against the full Russell-1000 universe:
 
 ```bash
-python current_baseline_data.py  # writes austrian.csv in the current folder
+python current_baseline_data.py  # writes current_baseline_data.csv in the current folder
 ```
 
 Key options:
 
-* `--output PATH` – CSV destination (default: `austrian.csv`)
+* `--output PATH` – CSV destination (default: `current_baseline_data.csv`)
 * `--max-count N` – limit the number of tickers processed (default: 1000)
 * `--rate-limit SECONDS` – wait time between Yahoo queries (default: 2)
 * `--save-ticker-cache` – persist the scraped ticker list to a local pickle so
@@ -37,8 +37,8 @@ Retrieve Weighted Average Cost of Capital data from **valueinvesting.io**:
 # Single ticker
 python fetch_wacc.py --tickers PHM
 
-# Batch scrape based on symbols present in austrian.csv
-python fetch_wacc.py --input austrian.csv --output wacc.csv
+# Batch scrape based on symbols present in current_baseline_data.csv
+python fetch_wacc.py --input current_baseline_data.csv --output wacc.csv
 ```
 
 The script writes a semicolon-separated CSV (`wacc.csv` by default) with the columns below:
@@ -54,7 +54,7 @@ Example: merge the WACC data with the main screener output in pandas:
 
 ```python
 import pandas as pd
-base = pd.read_csv("austrian.csv", sep=";")
+base = pd.read_csv("current_baseline_data.csv", sep=";")
 wacc = pd.read_csv("wacc.csv", sep=";")
 merged = base.merge(wacc, on="symbol", how="left")
 ```

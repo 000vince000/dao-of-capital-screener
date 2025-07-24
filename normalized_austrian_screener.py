@@ -79,8 +79,8 @@ def main() -> None:
     # Compute rankingScore
     df["rankingScore"] = df["valueMetricRank"] + df["excessReturnRank"]
 
-    # Sort output by rankingScore descending
-    df = df.sort_values(by="rankingScore", ascending=False)
+    # Sort output by rankingScore ascending (lower is better)
+    df = df.sort_values(by="rankingScore", ascending=True)
 
     df.to_csv(args.output, sep=";", index=False)
     print(f"✓ Saved normalized screener → {args.output.resolve()}")

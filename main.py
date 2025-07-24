@@ -7,9 +7,8 @@ Steps:
 3. Run `normalized_austrian_screener.py` to refresh `normalized_austrian.csv`, with `current_baseline_data.csv` and `wacc_top.csv` as input.
 4. Sort `normalized_austrian.csv` by `rankingScore` ascending and pick the top *N* tickers (default 50).
 5. Run `compute_roiic.py` to refresh `roiic_top.csv`, with `normalized_austrian.csv` as input.
-6. Compute "projectedReturn24Months" as Value Anchor + Quality Spread, with a Growth Gate
-7. Rank the whole list by projectedReturn24Months and sort as such.
-8. Merge the key metrics into a concise overview CSV (default: top50_overview.csv)
+6. Compute Growth Gate as roiic - wacc
+7. Merge the key metrics into a concise overview CSV (default: top50_overview.csv)
 
 This script assumes it is executed from the project root where the individual
 Python modules reside.
@@ -47,7 +46,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--skip-screener",
         action="store_true",
-        help="Skip running current_baseline_data.py if austrian.csv already exists.",
+        help="Skip running current_baseline_data.py if current_baseline_data.csv already exists.",
     )
     return p.parse_args()
 
@@ -90,17 +89,16 @@ def main() -> None:
         sys.exit(1)
 
     # ------------------------------------------------------------------
-    # 2. Pick top-N tickers by sumRanks
+    # 2. Process all tickers (no pre-filtering needed since ranking happens later)
     # ------------------------------------------------------------------
     df_base = pd.read_csv(current_baseline_data_csv, sep=";")
     
-    top_tickers: List[str] = top_df["symbol"].dropna().astype(str).tolist()
+    # Get all available tickers for WACC processing
+    all_tickers: List[str] = df_base["symbol"].dropna().astype(str).tolist()
 
-    if not top_tickers:
-        print("❌ No tickers found after ranking step.", file=sys.stderr)
+    if not all_tickers:
+        print("❌ No tickers found in baseline data.", file=sys.stderr)
         sys.exit(1)
-
-    ticker_str = ",".join(top_tickers)
 
     # ------------------------------------------------------------------
     # 3. Refresh WACC for entire universe before ranking normalization
@@ -116,78 +114,44 @@ def main() -> None:
     # 5. Load normalized CSV and pick top-N
     # ------------------------------------------------------------------
     norm_df = pd.read_csv("normalized_austrian.csv", sep=";")
-    if "faustmannRank" not in norm_df.columns and "sanitizedFaustmannRatio" in norm_df.columns:
-        norm_df["faustmannRank"] = norm_df["sanitizedFaustmannRatio"].rank(method="min", ascending=True)
-    df_sorted = norm_df.sort_values("sumRanks", ascending=True)
-    top_df = df_sorted.head(args.top)
+    # Data is already sorted by rankingScore ascending (best first)
+    top_df = norm_df.head(args.top)
     top_tickers = top_df["symbol"].dropna().astype(str).tolist()
 
     ticker_str = ",".join(top_tickers)
 
     # ------------------------------------------------------------------
-    # 6. Compute ROIC and ROE slopes for subset
+    # 6. Compute ROIIC for the full normalized dataset  
     # ------------------------------------------------------------------
-    _run_script("compute_roic_slope.py", "--tickers", ticker_str, "--output", "roic_slope_top.csv")
-    _run_script("compute_roe_slope.py", "--tickers", ticker_str, "--output", "roe_slope_top.csv")
+    _run_script("compute_roiic.py", "--input", "normalized_austrian.csv", "--output", "roiic_top.csv")
 
     # ------------------------------------------------------------------
     # 7. Merge selected metrics into summary CSV
     # ------------------------------------------------------------------
-    df_base_subset = norm_df[
-        [
-            "symbol",
-            "roic",
-            "MarketCap",
-            "sanitizedFaustmannRatio",
-            "sumRanks",
-            "opCashFlowYield",
-            "excessReturn",
-            "excessReturnRank",
-            "faustmannRank",
-            "industry",
-            "roeFlag",
-            "roe",
-        ]
-    ]
-
-    df_wacc = pd.read_csv("wacc_top.csv", sep=";")
-    df_roe_slope = pd.read_csv("roe_slope_top.csv", sep=";")
-    df_roic_slope = pd.read_csv("roic_slope_top.csv", sep=";")
-    merged = (
-        top_df[["symbol"]]  # ensure ordering of top tickers
-        .merge(df_base_subset, on="symbol", how="left")
-        .merge(df_wacc[["symbol", "wacc", "costOfEquity"]], on="symbol", how="left")
-        .merge(df_roic_slope, on="symbol", how="left")
-        .merge(df_roe_slope, on="symbol", how="left")
-    )
-
-    # Compute projectedReturn24Months
-    merged["normalizedSlope"] = np.where(
-        merged["roeFlag"], merged.get("roeSlope"), merged.get("roicSlope")
-    )
-    merged["projectedReturn24Months"] = (
-        merged["opCashFlowYield"] + merged["excessReturn"] + 2 * merged["normalizedSlope"]
-    )
+    # Load ROIIC data
+    df_roiic = pd.read_csv("roiic_top.csv", sep=";")
+    
+    # Merge top tickers with ROIIC data
+    merged = top_df.merge(df_roiic[["symbol", "roiic"]], on="symbol", how="left")
+    
+    # Compute Growth Gate as roiic - wacc (if both available)
+    if "wacc" in merged.columns and "roiic" in merged.columns:
+        merged["growthGate"] = merged["roiic"] - merged["wacc"]
 
     # Select and reorder columns
     cols_order = [
         "symbol",
         "industry",
-        "roeFlag",
         "MarketCap",
-        "roic",
-        "roe",
+        "roic",        
+        "wacc",
+        "roiic",
+        "valueMetric",
+        "valueMetricRank",
         "excessReturn",
         "excessReturnRank",
-        "faustmannRank",
-        "sumRanks",
-        "opCashFlowYield",
-        "wacc",
-        "costOfEquity",
-        "roicSlope",
-        "roeSlope",
-        "normalizedSlope",
-        "projectedReturn24Months",
+        "rankingScore",
+        "growthGate",
     ]
     # Ensure all expected columns exist
     for col in cols_order:
@@ -195,7 +159,7 @@ def main() -> None:
             merged[col] = np.nan
     merged = merged[cols_order]
 
-    merged = merged.sort_values("projectedReturn24Months", ascending=False)
+    merged = merged.sort_values("growthGate", ascending=False)
 
     merged.to_csv(args.output, sep=";", index=False)
     print(f"✓ Saved summary → {args.output.resolve()}")

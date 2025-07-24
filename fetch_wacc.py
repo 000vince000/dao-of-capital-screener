@@ -157,8 +157,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--input",
         type=pathlib.Path,
-        default=pathlib.Path("austrian.csv"),
-        help="Input CSV containing at least a 'symbol' column (default: austrian.csv)",
+        default=pathlib.Path("current_baseline_data.csv"),
+        help="Input CSV containing at least a 'symbol' column (default: current_baseline_data.csv)",
     )
     parser.add_argument(
         "--output",
