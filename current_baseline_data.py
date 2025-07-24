@@ -20,7 +20,7 @@ import argparse
 import pathlib
 import time
 import pickle
-from typing import List, Tuple
+from typing import List, Tuple, Set
 
 import pandas as pd
 from yahooquery import Ticker
@@ -33,45 +33,32 @@ from data_fetch_utils import (
     BASE_DELAY_SEC,
 )
 
+# Configuration
+from config import (
+    ROE_RELYING_INDUSTRIES,
+    DEFAULT_MAX_COUNT,
+    DEFAULT_RATE_LIMIT_SEC,
+    DEFAULT_BATCH_SIZE,
+    RUSSELL_1000_WIKI,
+    TICKER_CACHE_FILE,
+    load_known_roe_tickers,
+    update_known_roe_tickers,
+)
+
 # --------------------------------------------------------------------------------------
-# Constants & configuration
+# Helper functions for fast filtering
 # --------------------------------------------------------------------------------------
 
-# Wikipedia page that holds the Russell-1000 index constituents. This was the source in
-# the original notebook. Feel free to replace with any other wiki or CSV that contains
-# a column of tickers.
-RUSSELL_1000_WIKI = "https://en.wikipedia.org/wiki/Russell_1000_Index"
-
-# Sleep duration (seconds) between successive Yahoo queries to stay friendly to the API.
-DEFAULT_RATE_LIMIT_SEC = 0.5
-
-# Maximum number of tickers to process in a single run. The notebook capped this at
-# 1,000 which equals the full Russell-1000 universe. You can override this via CLI.
-DEFAULT_MAX_COUNT = 1000
-
-DEFAULT_INDUSTRIES_RELYING_ON_ROE: List[str] = [
-    "Asset Management",
-    "Insurance - Diversified",
-    "Insurance - Life",
-    "Insurance - Property & Casualty",
-    "Insurance - Specialty",
-    "Insurance Brokers",
-    "Credit Services",
-    "REIT - Diversified",
-    "REIT - Residential",
-    "REIT - Office",
-    "REIT - Retail",
-    "REIT - Industrial",
-    "REIT - Specialty",
-    "REIT - Mortgage",
-    "REIT - Healthcare Facilities",
-    "REIT - Hotel & Motel",
-    "Utilities - Regulated Electric",
-    "Utilities - Regulated Gas",
-    "Utilities - Regulated Water",
-    "Utilities - Diversified",
-    "Oil & Gas Midstream",
-]
+def extract_roe_tickers_from_df(df: pd.DataFrame) -> Set[str]:
+    """Extract tickers that are known to be from ROE-relying industries from a DataFrame."""
+    if df is None or df.empty or "industry" not in df.columns:
+        return set()
+    
+    roe_tickers = df[
+        df["industry"].isin(ROE_RELYING_INDUSTRIES)
+    ]["symbol"].dropna().unique()
+    
+    return set(roe_tickers)
 # --------------------------------------------------------------------------------------
 # Helper wrappers (scraping utilities moved to `data_fetch_utils`)
 # --------------------------------------------------------------------------------------
@@ -194,7 +181,8 @@ def process_universe(
     delay_ref: list[float],
     batch_size: int,
     processed: set[str],
-) -> Tuple[pd.DataFrame, List[str]]:
+    known_roe_tickers: set[str] = None,
+) -> Tuple[pd.DataFrame, List[str], Set[str]]:
     """Iterate over *tickers* in batches and return (metrics_df, retry_list)."""
 
     # ------------------------------------------------------------------
@@ -254,11 +242,12 @@ def process_universe(
 
         return bs_q, inc_q, cf_q, details_df, profile_df, valuation_all
 
-    def _process_symbols(batch_syms: list[str], dfs: tuple[pd.DataFrame, ...]) -> tuple[pd.DataFrame, list[str]]:
+    def _process_symbols(batch_syms: list[str], dfs: tuple[pd.DataFrame, ...]) -> tuple[pd.DataFrame, list[str], set[str]]:
         """Build metrics for each symbol in *batch_syms* using pre-fetched DataFrames."""
         bs_q, inc_q, cf_q, details_df, profile_df, valuation_all = dfs
         batch_out = pd.DataFrame()
         batch_retry: list[str] = []
+        discovered_roe_tickers: set[str] = set()
 
         for sym in batch_syms:
             processed.add(sym)
@@ -266,8 +255,9 @@ def process_universe(
             # Early filter: skip if industry relies on ROE
             if sym in profile_df.index:
                 industry = profile_df.loc[sym].get("industry", "")
-                if industry in DEFAULT_INDUSTRIES_RELYING_ON_ROE:
+                if industry in ROE_RELYING_INDUSTRIES:
                     print(f"    · skipping {sym} (ROE-relying industry: {industry})")
+                    discovered_roe_tickers.add(sym)
                     continue
 
             bs_row = bs_q[bs_q["symbol"] == sym]
@@ -295,7 +285,7 @@ def process_universe(
 
             batch_out = pd.concat([batch_out, metrics_df])
 
-        return batch_out, batch_retry
+        return batch_out, batch_retry, discovered_roe_tickers
 
     # ------------------------------------------------------------------
     # Main batching loop
@@ -303,8 +293,20 @@ def process_universe(
 
     overall_df = pd.DataFrame()
     overall_retry: list[str] = []
+    all_discovered_roe_tickers: set[str] = set()
 
-    subset = tickers[:max_count]
+    # Filter out known ROE tickers for fast passthrough
+    if known_roe_tickers is None:
+        known_roe_tickers = set()
+    
+    # Pre-filter tickers to exclude known ROE industries  
+    filtered_tickers = [t for t in tickers[:max_count] if t not in known_roe_tickers]
+    skipped_count = len(tickers[:max_count]) - len(filtered_tickers)
+    
+    if skipped_count > 0:
+        print(f"Fast passthrough: skipping {skipped_count} known ROE-relying tickers")
+    
+    subset = filtered_tickers
     total = len(subset)
 
     for batch_start in range(0, total, batch_size):
@@ -328,15 +330,16 @@ def process_universe(
             overall_retry.extend(batch)
             continue
 
-        df_batch, retry_batch = _process_symbols(batch, batch_dfs)
+        df_batch, retry_batch, discovered_roe = _process_symbols(batch, batch_dfs)
         overall_df = pd.concat([overall_df, df_batch])
         overall_retry.extend(retry_batch)
+        all_discovered_roe_tickers.update(discovered_roe)
 
         # ---------- adjust delay back down if possible ----------
         if delay_ref[0] > initial_delay:
             delay_ref[0] = max(BASE_DELAY_SEC, delay_ref[0] / 4)
 
-    return overall_df, overall_retry
+    return overall_df, overall_retry, all_discovered_roe_tickers
 
 
 # --------------------------------------------------------------------------------------
@@ -361,38 +364,43 @@ def main() -> None:
         "--rate-limit",
         type=float,
         default=DEFAULT_RATE_LIMIT_SEC,
-        help="Initial seconds to wait between Yahoo queries (default: 2)",
+        help=f"Initial seconds to wait between Yahoo queries (default: {DEFAULT_RATE_LIMIT_SEC})",
     )
     parser.add_argument(
         "--save-ticker-cache",
         action="store_true",
-        help="Cache the scraped ticker list to disk (russell1000tickers.pickle).",
+        help=f"Cache the scraped ticker list to disk ({TICKER_CACHE_FILE}).",
     )
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=20,
-        help="Number of tickers to process in each batch (default: 100)",
+        default=DEFAULT_BATCH_SIZE,
+        help=f"Number of tickers to process in each batch (default: {DEFAULT_BATCH_SIZE})",
     )
     args = parser.parse_args()
 
     # --------------------------------------------------------------
     # Load / fetch ticker universe
     # --------------------------------------------------------------
-    if pathlib.Path("russell1000tickers.pickle").exists():
-        tickers: List[str] = pickle.load(open("russell1000tickers.pickle", "rb"))
+    if pathlib.Path(TICKER_CACHE_FILE).exists():
+        tickers: List[str] = pickle.load(open(TICKER_CACHE_FILE, "rb"))
         print(f"Loaded {len(tickers)} cached tickers.")
     else:
         tickers = fetch_russell_1000_tickers()
         if args.save_ticker_cache:
-            pickle.dump(tickers, open("russell1000tickers.pickle", "wb"))
+            pickle.dump(tickers, open(TICKER_CACHE_FILE, "wb"))
         print(f"Fetched {len(tickers)} tickers from Wikipedia.")
 
     # --------------------------------------------------------------
-    # Skip already processed symbols if output/temp file exists
+    # Load cached ROE tickers and existing data
     # --------------------------------------------------------------
+    known_roe_tickers = load_known_roe_tickers()
+    if known_roe_tickers:
+        print(f"Loaded {len(known_roe_tickers)} known ROE-relying tickers from cache.")
+    
     existing_df = None
     processed_symbols: set[str] = set()
+    
     if args.output.exists():
         try:
             existing_df = pd.read_csv(args.output, sep=";")
@@ -404,6 +412,12 @@ def main() -> None:
                     f"Detected {len(processed_symbols)} previously processed tickers "
                     f"in {args.output.name}. They will be skipped in real-time."
                 )
+                
+            # Update cache with any newly discovered ROE tickers from existing data
+            newly_discovered = extract_roe_tickers_from_df(existing_df)
+            if newly_discovered:
+                known_roe_tickers = update_known_roe_tickers(newly_discovered)
+                
         except Exception as exc:
             print(f"⚠️  Could not read existing output file: {exc} – proceeding as if empty.")
             processed_symbols = set()
@@ -414,13 +428,18 @@ def main() -> None:
     delay_ref = [float(args.rate_limit)]  # mutable single-value holder
 
     try:
-        df, retry = process_universe(
+        df, retry, new_roe_tickers = process_universe(
             tickers,
             max_count=args.max_count,
             delay_ref=delay_ref,
             batch_size=args.batch_size,
             processed=processed_symbols,
+            known_roe_tickers=known_roe_tickers,
         )
+        
+        # Update cache with newly discovered ROE tickers
+        if new_roe_tickers:
+            update_known_roe_tickers(new_roe_tickers)
     except RateLimitExceeded as e:
         partial = e.partial_df if e.partial_df is not None else pd.DataFrame()
         if not partial.empty:
@@ -434,13 +453,18 @@ def main() -> None:
     if retry:
         print("\n------------- RETRY PASS -------------")
         try:
-            df_retry, retry2 = process_universe(
+            df_retry, retry2, new_roe_retry = process_universe(
                 retry,
                 max_count=len(retry),
                 delay_ref=delay_ref,
                 batch_size=args.batch_size,
                 processed=processed_symbols,
+                known_roe_tickers=known_roe_tickers,
             )
+            
+            # Update cache with newly discovered ROE tickers from retry
+            if new_roe_retry:
+                update_known_roe_tickers(new_roe_retry)
         except RateLimitExceeded as e:
             combined = pd.concat([df, e.partial_df]) if e.partial_df is not None else df
             combined.to_csv("austrian_partial.csv", sep=";")
@@ -453,13 +477,13 @@ def main() -> None:
     # --------------------------------------------------------------
     # Finalize and save dataframe
     # --------------------------------------------------------------
+    final_df = df
     if existing_df is not None:
-        combined = pd.concat([existing_df, df], ignore_index=True)
-        if "symbol" in combined.columns:
-            combined = combined.drop_duplicates(subset="symbol", keep="first")
-        combined.to_csv(args.output, sep=";", index=False)
-    else:
-        df.to_csv(args.output, sep=";", index=False)
+        final_df = pd.concat([existing_df, df], ignore_index=True)
+        if "symbol" in final_df.columns:
+            final_df = final_df.drop_duplicates(subset="symbol", keep="first")
+    
+    final_df.to_csv(args.output, sep=";", index=False)
     print(f"Saved results → {args.output.resolve()}")
 
 

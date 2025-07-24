@@ -58,14 +58,29 @@ def compute_nopat_and_invested_capital(income_df: pd.DataFrame, balance_df: pd.D
     if income_df.empty or balance_df.empty:
         return pd.DataFrame()
     
+    # Filter for annual data only (periodType == '12M')
+    if 'periodType' in income_df.columns:
+        income_annual_only = income_df[income_df['periodType'] == '12M']
+    else:
+        income_annual_only = income_df
+        
+    if 'periodType' in balance_df.columns:
+        balance_annual_only = balance_df[balance_df['periodType'] == '12M']
+    else:
+        balance_annual_only = balance_df
+    
     # Get the most recent 8 years of data (to have enough points)
-    income_recent = income_df.sort_values("asOfDate").tail(8)
-    balance_recent = balance_df.sort_values("asOfDate").tail(8)
+    income_recent = income_annual_only.sort_values("asOfDate").tail(8)
+    balance_recent = balance_annual_only.sort_values("asOfDate").tail(8)
+    
+    # Clean data before merging (drop rows with NaN in required columns)
+    income_clean = income_recent[["asOfDate", "EBIT", "TaxRateForCalcs"]].dropna()
+    balance_clean = balance_recent[["asOfDate", "InvestedCapital"]].dropna()
     
     # Merge on asOfDate
     merged = pd.merge(
-        income_recent[["asOfDate", "EBIT", "TaxRateForCalcs"]],
-        balance_recent[["asOfDate", "InvestedCapital"]],
+        income_clean,
+        balance_clean,
         on="asOfDate",
         how="inner"
     )
@@ -99,8 +114,8 @@ def compute_roiic_slope(data: pd.DataFrame) -> Optional[float]:
         nopat_slope, _, _, _, _ = stats.linregress(years, nopat)
         ic_slope, _, _, _, _ = stats.linregress(years, invested_capital)
         
-        # Avoid division by zero or negative denominators
-        if ic_slope <= 0:
+        # Avoid division by zero (but negative denominators are valid)
+        if ic_slope == 0:
             return None
             
         roiic = nopat_slope / ic_slope
@@ -121,10 +136,19 @@ def process_ticker(symbol: str, delay_ref: List[float], baseline_data: Optional[
         if income_annual.empty or balance_annual.empty:
             print(f"    · No annual data available for {symbol}")
             return symbol, None, 0
+            
+
         
-        # Filter for this symbol
-        symbol_income = income_annual[income_annual["symbol"] == symbol]
-        symbol_balance = balance_annual[balance_annual["symbol"] == symbol]
+        # Filter for this symbol (if symbol column exists, otherwise use all data)
+        if "symbol" in income_annual.columns:
+            symbol_income = income_annual[income_annual["symbol"] == symbol]
+        else:
+            symbol_income = income_annual  # Single symbol data
+            
+        if "symbol" in balance_annual.columns:
+            symbol_balance = balance_annual[balance_annual["symbol"] == symbol]
+        else:
+            symbol_balance = balance_annual  # Single symbol data
         
         # Compute historical NOPAT and InvestedCapital
         historical_data = compute_nopat_and_invested_capital(symbol_income, symbol_balance)

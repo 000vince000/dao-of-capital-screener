@@ -1,0 +1,28 @@
+{
+  "roe_tickers": [
+    "ACGL"
+  ],
+  "industries": [
+    "Asset Management",
+    "Insurance - Diversified",
+    "Insurance - Life",
+    "Insurance - Property & Casualty",
+    "Insurance - Specialty",
+    "Insurance Brokers",
+    "Credit Services",
+    "REIT - Diversified",
+    "REIT - Residential",
+    "REIT - Office",
+    "REIT - Retail",
+    "REIT - Industrial",
+    "REIT - Specialty",
+    "REIT - Mortgage",
+    "REIT - Healthcare Facilities",
+    "REIT - Hotel & Motel",
+    "Utilities - Regulated Electric",
+    "Utilities - Regulated Gas",
+    "Utilities - Regulated Water",
+    "Utilities - Diversified",
+    "Oil & Gas Midstream"
+  ]
+}
