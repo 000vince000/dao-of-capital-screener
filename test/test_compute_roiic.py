@@ -96,8 +96,9 @@ class TestComputeROIIC(unittest.TestCase):
         
         roiic = compute_roiic.compute_roiic_slope(test_data)
         
-        # Should return None for negative IC slope
-        self.assertIsNone(roiic)
+        # Expect ROIIC = 2B / (-20B) = -0.1
+        expected_roiic = -0.1
+        self.assertAlmostEqual(roiic, expected_roiic, places=3)
 
     def test_compute_roiic_slope_zero_ic_slope(self):
         """Test ROIIC slope calculation with zero InvestedCapital slope"""

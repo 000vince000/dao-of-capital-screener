@@ -44,6 +44,8 @@ from config import (
     load_known_roe_tickers,
     update_known_roe_tickers,
 )
+# Keep older tests and scripts compatible
+DEFAULT_INDUSTRIES_RELYING_ON_ROE = ROE_RELYING_INDUSTRIES
 
 # --------------------------------------------------------------------------------------
 # Helper functions for fast filtering
