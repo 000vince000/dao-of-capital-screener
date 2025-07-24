@@ -1,16 +1,48 @@
 #!/usr/bin/env python3
-"""Compute ROIIC (Return On Incremental Invested Capital) for each ticker.
+"""Compute ROIIC (Return On Incremental Invested Capital) for a list of tickers.
 
-ROIIC measures the return on incremental capital invested over time by fitting 
-regression lines through annual NOPAT and InvestedCapital data points, then 
-calculating slope(NOPAT) / slope(InvestedCapital).
+Overview
+~~~~~~~~
+• The script reads a universe of symbols from *normalized_austrian.csv* (semicolon-separated).
+• For every ticker it downloads up to the last eight fiscal years of **annual**
+  income-statement and balance-sheet data via *yahooquery*.
+• It calculates **NOPAT** (EBIT × (1 − tax rate)) and pairs it with the company’s
+  **Invested Capital** for each year.
+           ┌─>  ΔIC / IC₀  < 10%   ?  (Filter A ─ material investment) --> set ROIIC to None
+Input data ┤
+           └─>  Regression slope ROIIC
+                     │
+                     ▼
+               Winsorise ±40%        (Filter B ─ kill spikes)
+                     │
+                     ▼
+           ( ROIIC   –   WACC   ≥ 0 )   ?   →   PASS / FAIL
 
-Requirements:
-- At least 4 annual data points to compute meaningful slopes
-- Uses normalized_austrian.csv as input for ticker list
-- Can optionally reuse most recent NOPAT/InvestedCapital from current_baseline_data.csv
+• A straight-line regression is then fitted separately to the NOPAT and
+  Invested-Capital series:  slope(NOPAT) / slope(InvestedCapital) = ROIIC.
+  – At least **four** annual data points are required, otherwise ROIIC is
+    recorded as *None*.
+  – If the invested-capital slope is **zero** the ratio is undefined ⇒ ROIIC = None.
+  – A *negative* capital slope **is allowed** and will yield a negative ROIIC.
+• Optionally the most recent year can be *supplemented* from
+  *current_baseline_data.csv* to include fresh data not yet covered by Yahoo.
+• Results are written to *roiic_top.csv* with columns:
+    symbol; roiic; data_points_used
 
-Output: roiic_top.csv with columns: symbol, roiic, data_points_used
+Command-line flags (see --help for full list)
+-------------------------------------------
+--input       Path to normalized screener CSV (default normalized_austrian.csv)
+--baseline    Optional baseline file to enrich the time series with one extra
+              year (default current_baseline_data.csv)
+--output      Destination CSV (default roiic_top.csv)
+--rate-limit  Seconds to sleep between API calls (default 1.0)
+--max-count   Upper bound of tickers processed (default 100)
+
+Typical usage
+-------------
+$ python compute_roiic.py --input normalized_austrian.csv \
+                         --baseline current_baseline_data.csv \
+                         --output roiic_top.csv
 """
 
 import argparse
@@ -108,7 +140,17 @@ def compute_roiic_slope(data: pd.DataFrame) -> Optional[float]:
     years = data["year"].values
     nopat = data["nopat"].values
     invested_capital = data["InvestedCapital"].values
-    
+
+    # ------------------------------------------------------------------
+    # Filter A – ensure the capital base moved by at least 10 %
+    # Otherwise incremental returns are not meaningful.
+    # ------------------------------------------------------------------
+    ic_first = invested_capital[0]
+    ic_last = invested_capital[-1]
+    # Protect against divide-by-zero
+    if ic_first == 0 or abs(ic_last - ic_first) / abs(ic_first) < 0.10:
+        return None
+
     # Fit linear regression: y = slope * x + intercept
     try:
         nopat_slope, _, _, _, _ = stats.linregress(years, nopat)
@@ -118,7 +160,13 @@ def compute_roiic_slope(data: pd.DataFrame) -> Optional[float]:
         if ic_slope == 0:
             return None
             
-        roiic = nopat_slope / ic_slope
+        roiic_raw = nopat_slope / ic_slope
+
+        # ------------------------------------------------------------------
+        # Filter B – winsorise extreme ROIIC values to ±40 %
+        # ------------------------------------------------------------------
+        roiic = max(min(roiic_raw, 0.40), -0.40)
+
         return roiic
         
     except (ValueError, ZeroDivisionError):
