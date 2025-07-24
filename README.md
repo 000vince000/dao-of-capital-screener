@@ -18,7 +18,7 @@ The WACC scraper (`fetch_wacc.py`) depends on `requests` and `beautifulsoup4`, b
 Run the screener against the full Russell-1000 universe:
 
 ```bash
-python austrian_stock_screener.py  # writes austrian.csv in the current folder
+python current_baseline_data.py  # writes austrian.csv in the current folder
 ```
 
 Key options:

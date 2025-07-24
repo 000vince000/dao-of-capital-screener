@@ -3,7 +3,7 @@
 
 Prerequisites
 -------------
-1. `austrian.csv` – output of `austrian_stock_screener.py`
+1. `austrian.csv` – output of `current_baseline_data.py`
 2. `wacc_top.csv` – subset of WACC / Cost-of-Equity values (must contain `symbol`,
    `wacc`, `costOfEquity`)
 

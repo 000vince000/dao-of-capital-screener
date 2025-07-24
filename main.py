@@ -2,7 +2,7 @@
 """Pipeline driver that orchestrates the full screening workflow.
 
 Steps:
-1. Run `austrian_stock_screener.py` to refresh `austrian.csv`.
+1. Run `current_baseline_data.py` to refresh `austrian.csv`.
 2. Run `fetch_wacc.py` to refresh `wacc_top.csv`, with `austrian.csv` as input.
 3. Run `normalized_austrian_screener.py` to refresh `normalized_austrian.csv`, with `austrian.csv` and `wacc_top.csv` as input.
 4. Sort `normalized_austrian.csv` by `sumRanks` ascending and pick the top *N* tickers (default 50).
@@ -46,7 +46,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--skip-screener",
         action="store_true",
-        help="Skip running austrian_stock_screener.py if austrian.csv already exists.",
+        help="Skip running current_baseline_data.py if austrian.csv already exists.",
     )
     return p.parse_args()
 
@@ -81,7 +81,7 @@ def main() -> None:
     # 1. Run the screener (unless skipped)
     # ------------------------------------------------------------------
     if not args.skip_screener or not austrian_csv.exists():
-        _run_script("austrian_stock_screener.py")
+        _run_script("current_baseline_data.py")
     else:
         print("✓ Skipping screener step – austrian.csv already present.")
 

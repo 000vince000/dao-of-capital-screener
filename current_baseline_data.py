@@ -10,7 +10,7 @@ High-level workflow
 3. Compute derived metrics (NOPAT, ROIC, debt, preferred equity, net-worth).
 4. Persist the combined dataframe as CSV.
 
-Run `python austrian_stock_screener.py --help` for usage instructions.
+Run `python current_baseline_data.py --help` for usage instructions.
 """
 from __future__ import annotations
 
