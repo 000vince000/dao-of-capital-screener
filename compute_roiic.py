@@ -62,6 +62,100 @@ warnings.filterwarnings("ignore", category=UserWarning, module="yahooquery")
 # Import rate limiting utilities
 from data_fetch_utils import fetch_with_backoff, RateLimitExceeded, BASE_DELAY_SEC
 
+# --------------------------------------------------------------------------------------
+# Batch-fetch helpers
+# --------------------------------------------------------------------------------------
+
+
+def _batch_fetch_annual(symbols: list[str], delay_ref: list[float]) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Return (income_df, balance_df) for *symbols* using one Yahooquery call.
+
+    Both DataFrames are indexed by ``symbol`` and contain **all** rows returned by
+    Yahoo.  If the request fails with a non-rate-limit error we propagate the
+    exception so the caller can decide how to handle it.
+    """
+
+    ticker = Ticker(symbols, asynchronous=True)
+
+    income_df = fetch_with_backoff(
+        lambda: ticker.income_statement(frequency="a"),
+        desc=f"annual income batch {len(symbols)} syms",
+        delay_ref=delay_ref,
+    )
+
+    balance_df = fetch_with_backoff(
+        lambda: ticker.balance_sheet(frequency="a"),
+        desc=f"annual balance batch {len(symbols)} syms",
+        delay_ref=delay_ref,
+    )
+
+    # Ensure DataFrame shape even on single-symbol batches
+    if not isinstance(income_df, pd.DataFrame):
+        income_df = pd.DataFrame()
+    if not isinstance(balance_df, pd.DataFrame):
+        balance_df = pd.DataFrame()
+
+    # Yahooquery sometimes returns multi-index (symbol, asOfDate). Reset index for easier slicing.
+    for df in (income_df, balance_df):
+        if isinstance(df.index, pd.MultiIndex):
+            df.reset_index(level=0, inplace=True)
+        elif "symbol" not in df.columns:
+            # Single-level index holding the symbols
+            df.reset_index(inplace=True)
+        # Ensure the column is named exactly "symbol"
+        if "level_0" in df.columns and "symbol" not in df.columns:
+            df.rename(columns={"level_0": "symbol"}, inplace=True)
+        if df.index.name == "symbol":  # rare case
+            df.reset_index(inplace=True)
+
+    return income_df, balance_df
+
+
+def _process_symbol_from_batch(
+    symbol: str,
+    inc_df: pd.DataFrame,
+    bs_df: pd.DataFrame,
+    baseline_data: Optional[pd.DataFrame],
+) -> tuple[str, Optional[float], int, str | None]:
+    """Compute ROIIC for *symbol* using already-fetched DataFrames.
+
+    Returns (symbol, roiic, data_points, reason).
+    """
+    # Slice data for this symbol; Yahooquery upper-cases symbols already
+    inc_slice = inc_df[inc_df["symbol"] == symbol]
+    bs_slice = bs_df[bs_df["symbol"] == symbol]
+
+    if inc_slice.empty or bs_slice.empty:
+        return symbol, None, 0, "no Yahoo data"
+
+    # Early InvestedCapital presence check
+    if "InvestedCapital" not in bs_slice.columns:
+        return symbol, None, 0, "InvestedCapital missing"
+
+    hist = compute_nopat_and_invested_capital(inc_slice, bs_slice)
+    if hist.empty:
+        return symbol, None, 0, "historical merge empty"
+
+    # Supplement with baseline year if useful
+    if baseline_data is not None:
+        base_row = baseline_data[baseline_data["symbol"] == symbol]
+        if not base_row.empty and {"nopat", "InvestedCapital", "asOfDate"}.issubset(base_row.columns):
+            year = pd.to_datetime(base_row["asOfDate"].iloc[0]).year
+            if year not in hist["year"].values:
+                hist = pd.concat([
+                    hist,
+                    pd.DataFrame(
+                        {
+                            "year": [year],
+                            "nopat": [base_row["nopat"].iloc[0]],
+                            "InvestedCapital": [base_row["InvestedCapital"].iloc[0]],
+                        }
+                    ),
+                ], ignore_index=True)
+
+    roiic, reason = compute_roiic_slope(hist, with_reason=True)
+    return symbol, roiic, len(hist), reason
+
 
 def fetch_annual_data(symbol: str, delay_ref: List[float]) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Fetch annual income statement and balance sheet data for a single symbol."""
@@ -129,10 +223,21 @@ def compute_nopat_and_invested_capital(income_df: pd.DataFrame, balance_df: pd.D
     return merged[["year", "nopat", "InvestedCapital"]].dropna()
 
 
-def compute_roiic_slope(data: pd.DataFrame) -> Optional[float]:
-    """Compute ROIIC using regression slopes: slope(NOPAT) / slope(InvestedCapital)."""
-    if len(data) < 4:  # Need at least 4 points for meaningful regression
-        return None
+def compute_roiic_slope(data: pd.DataFrame, *, with_reason: bool = False) -> Optional[float] | tuple[Optional[float], str | None]:
+    """Compute ROIIC using regression slopes: slope(NOPAT) / slope(InvestedCapital).
+
+    Parameters
+    ----------
+    data : pd.DataFrame
+        Must contain columns ``year``, ``nopat``, ``InvestedCapital``.
+    with_reason : bool, optional
+        If *True* the function returns a *(roiic, reason)* tuple where **reason** is
+        a short explanatory string when ROIIC cannot be computed (``None``
+        otherwise).  When *False* (default) the original behaviour is preserved
+        for backwards-compatibility – you get just the float or *None*.
+    """
+    if len(data) < 4:
+        return (None, "< 4 annual points") if with_reason else None
     
     # Sort by year to ensure proper time series
     data = data.sort_values("year")
@@ -143,13 +248,11 @@ def compute_roiic_slope(data: pd.DataFrame) -> Optional[float]:
 
     # ------------------------------------------------------------------
     # Filter A – ensure the capital base moved by at least 10 %
-    # Otherwise incremental returns are not meaningful.
     # ------------------------------------------------------------------
     ic_first = invested_capital[0]
     ic_last = invested_capital[-1]
-    # Protect against divide-by-zero
     if ic_first == 0 or abs(ic_last - ic_first) / abs(ic_first) < 0.10:
-        return None
+        return (None, "ΔIC/IC₀ < 10 %") if with_reason else None
 
     # Fit linear regression: y = slope * x + intercept
     try:
@@ -158,7 +261,7 @@ def compute_roiic_slope(data: pd.DataFrame) -> Optional[float]:
         
         # Avoid division by zero (but negative denominators are valid)
         if ic_slope == 0:
-            return None
+            return (None, "IC slope = 0") if with_reason else None
             
         roiic_raw = nopat_slope / ic_slope
 
@@ -166,11 +269,12 @@ def compute_roiic_slope(data: pd.DataFrame) -> Optional[float]:
         # Filter B – winsorise extreme ROIIC values to ±40 %
         # ------------------------------------------------------------------
         roiic = max(min(roiic_raw, 0.40), -0.40)
-
+        if with_reason:
+            return roiic, None
         return roiic
         
     except (ValueError, ZeroDivisionError):
-        return None
+        return (None, "regression error") if with_reason else None
 
 
 def process_ticker(symbol: str, delay_ref: List[float], baseline_data: Optional[pd.DataFrame] = None) -> Tuple[str, Optional[float], int]:
@@ -180,7 +284,15 @@ def process_ticker(symbol: str, delay_ref: List[float], baseline_data: Optional[
         
         # Fetch historical annual data
         income_annual, balance_annual = fetch_annual_data(symbol, delay_ref)
-        
+
+        # yahooquery may return a dict with an error payload in place of a DataFrame
+        if not isinstance(income_annual, pd.DataFrame):
+            print("    · Income-statement data malformed (dict) – skipping")
+            return symbol, None, 0
+        if not isinstance(balance_annual, pd.DataFrame):
+            print("    · Balance-sheet data malformed (dict) – skipping")
+            return symbol, None, 0
+            
         if income_annual.empty or balance_annual.empty:
             print(f"    · No annual data available for {symbol}")
             return symbol, None, 0
@@ -199,6 +311,13 @@ def process_ticker(symbol: str, delay_ref: List[float], baseline_data: Optional[
             symbol_balance = balance_annual  # Single symbol data
         
         # Compute historical NOPAT and InvestedCapital
+        # Early exit if Yahoo data lacks InvestedCapital entirely
+        if "InvestedCapital" not in symbol_balance.columns:
+            print(
+                f"    · InvestedCapital column missing in Yahoo balance-sheet data for {symbol} – skipping"
+            )
+            return symbol, None, 0
+
         historical_data = compute_nopat_and_invested_capital(symbol_income, symbol_balance)
         
         if historical_data.empty:
@@ -224,19 +343,57 @@ def process_ticker(symbol: str, delay_ref: List[float], baseline_data: Optional[
                     historical_data = pd.concat([historical_data, new_row], ignore_index=True)
         
         # Compute ROIIC using slope method
-        roiic = compute_roiic_slope(historical_data)
+        roiic, reason = compute_roiic_slope(historical_data, with_reason=True)
         data_points = len(historical_data)
         
         if roiic is not None:
             print(f"    · ROIIC: {roiic:.4f} (using {data_points} data points)")
         else:
-            print(f"    · Could not compute ROIIC for {symbol} ({data_points} data points)")
+            print(f"    · Could not compute ROIIC for {symbol} ({data_points} data points) - Reason: {reason}")
         
         return symbol, roiic, data_points
         
     except Exception as e:
         print(f"    · Error processing {symbol}: {e}")
         return symbol, None, 0
+
+
+def _compute_from_dfs(
+    input_df: pd.DataFrame,
+    baseline_data: Optional[pd.DataFrame],
+    rate_limit: float,
+    max_count: int,
+) -> pd.DataFrame:
+    """Process a batch of tickers from a DataFrame."""
+    tickers = input_df["symbol"].dropna().unique().tolist()[:max_count]
+    print(f"Processing {len(tickers)} tickers for ROIIC computation...")
+    
+    delay_ref = [float(rate_limit)]
+    results = []
+    
+    for i, symbol in enumerate(tickers, 1):
+        print(f"[{i}/{len(tickers)}]", end=" ")
+        symbol_clean = str(symbol).strip()
+        
+        try:
+            symbol_result, roiic, data_points = process_ticker(symbol_clean, delay_ref, baseline_data)
+            results.append({
+                "symbol": symbol_result,
+                "roiic": roiic,
+                "data_points_used": data_points
+            })
+        except RateLimitExceeded:
+            print("❌ Rate limit exceeded, stopping early")
+            break
+        except Exception as e:
+            print(f"    · Unexpected error for {symbol_clean}: {e}")
+            results.append({
+                "symbol": symbol_clean,
+                "roiic": None,
+                "data_points_used": 0
+            })
+    
+    return pd.DataFrame(results)
 
 
 def main():
@@ -271,6 +428,13 @@ def main():
         default=100,
         help="Maximum number of tickers to process (default: 100)"
     )
+
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=20,
+        help="Number of tickers to fetch per Yahooquery batch (default: 20)",
+    )
     
     args = parser.parse_args()
     
@@ -293,43 +457,46 @@ def main():
         except Exception as e:
             print(f"⚠️  Could not load baseline data: {e}")
     
-    # Get unique tickers
-    tickers = input_df["symbol"].dropna().unique().tolist()[:args.max_count]
-    print(f"Processing {len(tickers)} tickers for ROIIC computation...")
-    
-    # Process each ticker
+    # ------------------------------------------------------------------
+    # NEW: Batch-async processing
+    # ------------------------------------------------------------------
+    symbols = input_df["symbol"].dropna().astype(str).tolist()[: args.max_count]
+
     delay_ref = [float(args.rate_limit)]
-    results = []
-    
-    for i, symbol in enumerate(tickers, 1):
-        print(f"[{i}/{len(tickers)}]", end=" ")
-        symbol_clean = str(symbol).strip()
-        
+    results: list[dict] = []
+
+    for start in range(0, len(symbols), args.batch_size):
+        chunk = symbols[start : start + args.batch_size]
+        print(f"Fetching batch {start + 1}–{start + len(chunk)} / {len(symbols)}", flush=True)
+
         try:
-            symbol_result, roiic, data_points = process_ticker(symbol_clean, delay_ref, baseline_data)
-            results.append({
-                "symbol": symbol_result,
-                "roiic": roiic,
-                "data_points_used": data_points
-            })
+            inc_df, bs_df = _batch_fetch_annual(chunk, delay_ref)
         except RateLimitExceeded:
-            print("❌ Rate limit exceeded, stopping early")
+            print("❌ Rate limit exceeded during batch fetch – aborting", flush=True)
             break
-        except Exception as e:
-            print(f"    · Unexpected error for {symbol_clean}: {e}")
-            results.append({
-                "symbol": symbol_clean,
-                "roiic": None,
-                "data_points_used": 0
-            })
-    
-    # Create output DataFrame
+        except Exception as exc:
+            print(f"❌ Unexpected error during batch fetch: {exc}", flush=True)
+            # fallback – mark all symbols in chunk as failed
+            for sym in chunk:
+                results.append({"symbol": sym, "roiic": None, "data_points_used": 0})
+            continue
+
+        for sym in chunk:
+            print(f"  · Processing {sym}...", flush=True)
+            sym_r, roiic, pts, reason = _process_symbol_from_batch(sym, inc_df, bs_df, baseline_data)
+            if roiic is not None:
+                print(f"    ROIIC: {roiic:.4f} ({pts} pts)")
+            else:
+                print(f"    Skipped – {reason}")
+
+            results.append({"symbol": sym_r, "roiic": roiic, "data_points_used": pts})
+
     results_df = pd.DataFrame(results)
     
     # Filter out symbols with no ROIIC computed
     valid_results = results_df[results_df["roiic"].notna()]
     
-    print(f"\n📊 Successfully computed ROIIC for {len(valid_results)} out of {len(results)} tickers")
+    print(f"\n📊 Successfully computed ROIIC for {len(valid_results)} out of {len(results_df)} tickers")
     
     # Sort by ROIIC descending (higher is better)
     if not valid_results.empty:
