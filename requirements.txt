@@ -1,4 +1,6 @@
 pandas>=1.4
+numpy>=1.22
+scipy>=1.8
 beautifulsoup4>=4.12
 requests>=2.31
 yahooquery>=2.3 
