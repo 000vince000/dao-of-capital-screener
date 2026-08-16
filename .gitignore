@@ -4,3 +4,7 @@ __pycache__/
 venv/
 *.egg-info/
 .pytest_cache/
+
+# Pipeline-generated output data (regenerable via the scripts, not source)
+*.csv
+*.pickle
