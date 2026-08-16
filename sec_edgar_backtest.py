@@ -74,7 +74,7 @@ sm.initialize_session = _non_impersonated_session
 _yq_base.initialize_session = _non_impersonated_session
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from compute_roiic import compute_roiic_slope  # reuse the exact same regression logic
+from compute_roiic import compute_roiic_slope, normalize_annual_series  # reuse the exact same logic as the live pipeline
 from fetch_wacc import fetch_wacc
 
 _CIK_MAP: Optional[dict] = None
@@ -228,36 +228,81 @@ def process_ticker(ticker: str, anchor_date: date, wacc: float) -> dict:
             return None
         return rate
 
+    def pretax_for_fy(fy_end: pd.Timestamp) -> Optional[float]:
+        pre = pretax_annual[pretax_annual["end"] == fy_end]
+        return float(pre.iloc[0]["val"]) if not pre.empty else None
+
     # --- anchor year: most recent FY10-K ending on/before anchor_date ---
     anchor_ts = pd.Timestamp(anchor_date)
     eligible = ebit_annual[ebit_annual["end"] <= anchor_ts]
     if eligible.empty:
         return {"symbol": ticker, "status": "no_data_before_anchor"}
-    anchor_fy = eligible.iloc[-1]
-    anchor_fy_end = anchor_fy["end"]
-    anchor_ebit = float(anchor_fy["val"])
-    anchor_tax = tax_rate_for_fy(anchor_fy_end)
-    if anchor_tax is None:
-        clean_rates = [tax_rate_for_fy(e) for e in ebit_annual["end"] if tax_rate_for_fy(e) is not None]
-        anchor_tax = pd.Series(clean_rates).median() if clean_rates else 0.21
-    anchor_ic = invested_capital_at(anchor_fy_end)
+    anchor_fy_end = eligible.iloc[-1]["end"]
+
+    # --- Build one annual window (up to 8 FYs ending at-or-before the anchor
+    # year) shared by both the anchor-year ROIC snapshot and the ROIIC
+    # regression, and normalize it ONCE via the same shared function the live
+    # pipeline uses, so the two figures stay internally consistent. ---
+    rd_units = _first_present(gaap, ["ResearchAndDevelopmentExpense"])
+    sga_units = _first_present(gaap, ["SellingGeneralAndAdministrativeExpense", "GeneralAndAdministrativeExpense"])
+    restructuring_units = _first_present(gaap, ["RestructuringCharges"])
+    rd_annual = _annual_series(rd_units) if rd_units else pd.DataFrame()
+    sga_annual = _annual_series(sga_units) if sga_units else pd.DataFrame()
+    restructuring_annual = _annual_series(restructuring_units) if restructuring_units else pd.DataFrame()
+
+    def _val_for(series_df: pd.DataFrame, fy_end: pd.Timestamp) -> Optional[float]:
+        if series_df.empty:
+            return None
+        row = series_df[series_df["end"] == fy_end]
+        return float(row.iloc[0]["val"]) if not row.empty else None
+
+    hist_window = ebit_annual[ebit_annual["end"] <= anchor_fy_end].tail(8).copy().rename(columns={"val": "EBIT"})
+    hist_window["InvestedCapital"] = hist_window["end"].apply(invested_capital_at)
+    hist_window["PretaxIncome"] = hist_window["end"].apply(pretax_for_fy)
+    hist_window["TaxRateForCalcs"] = hist_window["end"].apply(lambda e: tax_rate_for_fy(e))
+    hist_window["ResearchAndDevelopment"] = hist_window["end"].apply(lambda e: _val_for(rd_annual, e))
+    hist_window["SellingGeneralAndAdministration"] = hist_window["end"].apply(lambda e: _val_for(sga_annual, e))
+    hist_window["RestructuringAndMergernAcquisition"] = hist_window["end"].apply(lambda e: _val_for(restructuring_annual, e))
+
+    # .apply() over a column of Python None/float results in an object-dtype
+    # column, which silently breaks downstream numpy/scipy arithmetic in
+    # confusing ways - coerce to real numeric dtype before anything else.
+    for col in ["EBIT", "PretaxIncome", "TaxRateForCalcs", "ResearchAndDevelopment",
+                "SellingGeneralAndAdministration", "RestructuringAndMergernAcquisition"]:
+        hist_window[col] = pd.to_numeric(hist_window[col], errors="coerce")
+
+    # Fill in-window missing/None tax rates with the window's own median before normalizing,
+    # so normalize_annual_series() has something usable for every row (mirrors the live
+    # pipeline's tolerance for gaps rather than dropping rows outright).
+    fallback_rate = hist_window["TaxRateForCalcs"].dropna().median()
+    if pd.isna(fallback_rate):
+        fallback_rate = 0.21
+    hist_window["TaxRateForCalcs"] = hist_window["TaxRateForCalcs"].fillna(fallback_rate)
+
+    normalized = normalize_annual_series(hist_window)
+    hist_window["EBIT_normalized"] = normalized["EBIT_normalized"].values
+    hist_window["TaxRateForCalcs_normalized"] = normalized["TaxRateForCalcs_normalized"].values
+    hist_window["flagged"] = normalized["flagged"].values
+    hist_window["flag_reasons"] = normalized["flag_reasons"].values
+    hist_window["nopat"] = hist_window["EBIT_normalized"] * (1 - hist_window["TaxRateForCalcs_normalized"])
+    hist_window["year"] = hist_window["end"].dt.year
+
+    anchor_row = hist_window[hist_window["end"] == anchor_fy_end].iloc[0]
+    anchor_ebit = float(anchor_row["EBIT_normalized"])
+    anchor_tax = float(anchor_row["TaxRateForCalcs_normalized"])
+    anchor_ic = float(anchor_row["InvestedCapital"])
     if anchor_ic <= 0:
         return {"symbol": ticker, "status": "bad_invested_capital"}
 
     anchor_nopat = anchor_ebit * (1 - anchor_tax)
     anchor_roic = anchor_nopat / anchor_ic
 
-    # --- ROIIC: regression over the 8 FYs ending at-or-before the anchor year ---
-    hist_window = ebit_annual[ebit_annual["end"] <= anchor_fy_end].tail(8).copy()
-    hist_window["InvestedCapital"] = hist_window["end"].apply(invested_capital_at)
-    hist_window["nopat"] = hist_window.apply(
-        lambda r: r["val"] * (1 - (tax_rate_for_fy(r["end"]) or anchor_tax)), axis=1
-    )
-    hist_window["year"] = hist_window["end"].dt.year
     roiic, roiic_reason = compute_roiic_slope(hist_window[["year", "nopat", "InvestedCapital"]], with_reason=True)
 
     excess_return = anchor_roic - wacc
     growth_gate = (roiic - wacc) if roiic is not None else None
+    flagged_years = hist_window[hist_window["flagged"]][["year", "flag_reasons"]]
+    flagged_desc = "; ".join(f"{int(r.year)}: {r.flag_reasons}" for r in flagged_years.itertuples()) or "(none)"
 
     price_anchor = _historical_price(ticker, anchor_fy_end.date())
     price_now = _historical_price(ticker, date.today())
@@ -279,6 +324,7 @@ def process_ticker(ticker: str, anchor_date: date, wacc: float) -> dict:
         "roiic_reason": roiic_reason,
         "growthGate": growth_gate,
         "data_points_used": len(hist_window),
+        "flagged_years": flagged_desc,
         "price_anchor": price_anchor,
         "price_now": price_now,
         "fwd_return": fwd_return,

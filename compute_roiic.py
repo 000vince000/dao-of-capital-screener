@@ -63,6 +63,121 @@ warnings.filterwarnings("ignore", category=UserWarning, module="yahooquery")
 from data_fetch_utils import fetch_with_backoff, RateLimitExceeded, BASE_DELAY_SEC
 
 # --------------------------------------------------------------------------------------
+# Shared one-time-item normalization (Step 1 of the ROIIC improvement plan)
+# --------------------------------------------------------------------------------------
+
+SPIKE_PRONE_COLS = [
+    "ResearchAndDevelopment",
+    "SellingGeneralAndAdministration",
+    "RestructuringAndMergernAcquisition",
+]
+
+
+def normalize_annual_series(df: pd.DataFrame, spike_multiple: float = 2.0) -> pd.DataFrame:
+    """Flag and normalize one-time items across a whole annual EBIT/tax series
+    before it feeds the ROIIC regression.
+
+    This is the whole-series counterpart to the trailing-TTM normalization in
+    normalize_ebit.py (see that file for the original rationale: raw GAAP EBIT
+    can swing on a single quarter/year's acquired-IPR&D charge, restructuring,
+    or other one-off item). Both compute_roiic.py (live pipeline, yahooquery
+    data) and sec_edgar_backtest.py (SEC XBRL data) shape their annual data
+    into this same column layout and call this one function, so the two stay
+    consistent rather than drifting apart as two implementations.
+
+    Expected columns: 'EBIT', 'TaxRateForCalcs'. Optional (skipped gracefully
+    if absent): 'PretaxIncome' (enables tax-rate sanity correction),
+    'ResearchAndDevelopment', 'SellingGeneralAndAdministration',
+    'RestructuringAndMergernAcquisition', 'TotalUnusualItems'.
+
+    Returns the same rows plus: 'EBIT_normalized', 'TaxRateForCalcs_normalized',
+    'flagged' (bool), 'flag_reasons' (str), 'addback' (float).
+    """
+    d = df.copy().reset_index(drop=True)
+    if d.empty:
+        d["EBIT_normalized"] = d.get("EBIT")
+        d["TaxRateForCalcs_normalized"] = d.get("TaxRateForCalcs")
+        d["flagged"] = pd.Series(dtype=bool)
+        d["flag_reasons"] = pd.Series(dtype=str)
+        d["addback"] = pd.Series(dtype=float)
+        return d
+
+    # Defensive: different data sources (yahooquery vs. hand-built SEC XBRL series)
+    # can leave a column as object-dtype full of Python None rather than a proper
+    # float NaN (e.g. a tag with no data before a certain year). That silently
+    # breaks downstream numpy/scipy arithmetic in confusing ways, so coerce here.
+    numeric_cols = ["EBIT", "TaxRateForCalcs", "PretaxIncome", "TotalUnusualItems"] + SPIKE_PRONE_COLS
+    for col in numeric_cols:
+        if col in d.columns:
+            d[col] = pd.to_numeric(d[col], errors="coerce")
+
+    def _baseline(col: str, exclude_mask: pd.Series) -> Optional[float]:
+        if col not in d.columns:
+            return None
+        vals = d.loc[~exclude_mask, col].dropna()
+        vals = vals[vals > 0]
+        return float(vals.median()) if len(vals) >= 2 else None
+
+    exclude = pd.Series(False, index=d.index)
+    flagged = pd.Series(False, index=d.index)
+    reasons_col = pd.Series("", index=d.index)
+    addback_col = pd.Series(0.0, index=d.index)
+
+    # Two passes: first pass flags against the whole-series baseline, second
+    # pass re-flags against a baseline that excludes anything already flagged,
+    # so one bad year can't drag down the baseline used to judge another.
+    for _pass in range(2):
+        new_exclude = exclude.copy()
+        for idx, row in d.iterrows():
+            reasons = []
+            addback = 0.0
+
+            unusual = row.get("TotalUnusualItems")
+            if pd.notna(unusual) and unusual != 0:
+                addback += -float(unusual)
+                reasons.append(f"TotalUnusualItems={unusual:,.0f}")
+
+            for col in SPIKE_PRONE_COLS:
+                if col not in row.index or pd.isna(row[col]):
+                    continue
+                baseline = _baseline(col, exclude if _pass == 0 else new_exclude)
+                if baseline is None:
+                    continue
+                if row[col] > spike_multiple * baseline:
+                    excess = float(row[col]) - baseline
+                    addback += excess
+                    reasons.append(f"{col}={row[col]:,.0f} vs baseline {baseline:,.0f} (+{excess:,.0f})")
+
+            if reasons:
+                new_exclude.loc[idx] = True
+                flagged.loc[idx] = True
+                reasons_col.loc[idx] = "; ".join(reasons)
+                addback_col.loc[idx] = addback
+            else:
+                new_exclude.loc[idx] = False
+                flagged.loc[idx] = False
+                reasons_col.loc[idx] = ""
+                addback_col.loc[idx] = 0.0
+        exclude = new_exclude
+
+    d["flagged"] = flagged
+    d["flag_reasons"] = reasons_col
+    d["addback"] = addback_col
+    d["EBIT_normalized"] = d["EBIT"] + d["addback"]
+
+    d["TaxRateForCalcs_normalized"] = d["TaxRateForCalcs"]
+    if "PretaxIncome" in d.columns:
+        clean = d[(d["PretaxIncome"] > 0) & (~d["flagged"])]
+        if clean.empty:
+            clean = d[d["PretaxIncome"] > 0]
+        if not clean.empty:
+            normalized_tax_rate = float(clean["TaxRateForCalcs"].median())
+            bad_tax = d["flagged"] | (d["PretaxIncome"] <= 0)
+            d.loc[bad_tax, "TaxRateForCalcs_normalized"] = normalized_tax_rate
+
+    return d
+
+# --------------------------------------------------------------------------------------
 # Batch-fetch helpers
 # --------------------------------------------------------------------------------------
 
@@ -178,27 +293,40 @@ def fetch_annual_data(symbol: str, delay_ref: List[float]) -> Tuple[pd.DataFrame
     return income_annual, balance_annual
 
 
-def compute_nopat_and_invested_capital(income_df: pd.DataFrame, balance_df: pd.DataFrame) -> pd.DataFrame:
-    """Compute NOPAT and InvestedCapital for annual data points."""
+def compute_nopat_and_invested_capital(income_df: pd.DataFrame, balance_df: pd.DataFrame, *, normalize: bool = True) -> pd.DataFrame:
+    """Compute NOPAT and InvestedCapital for annual data points.
+
+    normalize: apply normalize_annual_series() to the EBIT/tax inputs first
+    (default True). Set False to reproduce the pre-normalization behaviour.
+    """
     # Filter for the symbol and merge on asOfDate
     if income_df.empty or balance_df.empty:
         return pd.DataFrame()
-    
+
     # Filter for annual data only (periodType == '12M')
     if 'periodType' in income_df.columns:
         income_annual_only = income_df[income_df['periodType'] == '12M']
     else:
         income_annual_only = income_df
-        
+
     if 'periodType' in balance_df.columns:
         balance_annual_only = balance_df[balance_df['periodType'] == '12M']
     else:
         balance_annual_only = balance_df
-    
+
     # Get the most recent 8 years of data (to have enough points)
     income_recent = income_annual_only.sort_values("asOfDate").tail(8)
     balance_recent = balance_annual_only.sort_values("asOfDate").tail(8)
-    
+
+    if normalize and not income_recent.empty:
+        norm_cols = ["asOfDate", "EBIT", "TaxRateForCalcs"] + [
+            c for c in SPIKE_PRONE_COLS + ["PretaxIncome", "TotalUnusualItems"] if c in income_recent.columns
+        ]
+        normalized = normalize_annual_series(income_recent[norm_cols])
+        income_recent = income_recent.copy()
+        income_recent["EBIT"] = normalized["EBIT_normalized"].values
+        income_recent["TaxRateForCalcs"] = normalized["TaxRateForCalcs_normalized"].values
+
     # Clean data before merging (drop rows with NaN in required columns)
     income_clean = income_recent[["asOfDate", "EBIT", "TaxRateForCalcs"]].dropna()
     balance_clean = balance_recent[["asOfDate", "InvestedCapital"]].dropna()
@@ -242,9 +370,9 @@ def compute_roiic_slope(data: pd.DataFrame, *, with_reason: bool = False) -> Opt
     # Sort by year to ensure proper time series
     data = data.sort_values("year")
     
-    years = data["year"].values
-    nopat = data["nopat"].values
-    invested_capital = data["InvestedCapital"].values
+    years = data["year"].astype(float).values
+    nopat = data["nopat"].astype(float).values
+    invested_capital = data["InvestedCapital"].astype(float).values
 
     # ------------------------------------------------------------------
     # Filter A – ensure the capital base moved by at least 10 %
