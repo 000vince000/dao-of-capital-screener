@@ -313,9 +313,15 @@ def process_ticker(ticker: str, anchor_date: date, wacc: float) -> dict:
         columns={"InvestedCapital_organic": "InvestedCapital"}
     )
     roiic, roiic_reason = compute_roiic_slope(regression_input, with_reason=True)
+    # Raw (pre-buyback-addback) roiic alongside the organic one - a sharp
+    # divergence between the two flags a name whose incremental-capital story
+    # depends on a judgment call about the buybacks, not something the
+    # pipeline can resolve on its own (see TODO.md #4).
+    roiic_raw, _ = compute_roiic_slope(hist_window[["year", "nopat", "InvestedCapital"]], with_reason=True)
 
     excess_return = anchor_roic - wacc
     growth_gate = (roiic - wacc) if roiic is not None else None
+    growth_gate_raw = (roiic_raw - wacc) if roiic_raw is not None else None
     flagged_years = hist_window[hist_window["flagged"]][["year", "flag_reasons"]]
     flagged_desc = "; ".join(f"{int(r.year)}: {r.flag_reasons}" for r in flagged_years.itertuples()) or "(none)"
 
@@ -336,8 +342,10 @@ def process_ticker(ticker: str, anchor_date: date, wacc: float) -> dict:
         "wacc": wacc,
         "excessReturn": excess_return,
         "roiic": roiic,
+        "roiic_raw": roiic_raw,
         "roiic_reason": roiic_reason,
         "growthGate": growth_gate,
+        "growthGate_raw": growth_gate_raw,
         "data_points_used": len(hist_window),
         "flagged_years": flagged_desc,
         "price_anchor": price_anchor,

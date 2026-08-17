@@ -290,10 +290,15 @@ def _process_symbol_from_batch(
     bs_df: pd.DataFrame,
     baseline_data: Optional[pd.DataFrame],
     cf_df: Optional[pd.DataFrame] = None,
-) -> tuple[str, Optional[float], int, str | None]:
+) -> tuple[str, Optional[float], int, str | None, Optional[float]]:
     """Compute ROIIC for *symbol* using already-fetched DataFrames.
 
-    Returns (symbol, roiic, data_points, reason).
+    Returns (symbol, roiic, data_points, reason, roiic_raw). ``roiic`` is the
+    buyback-adjusted ("organic") value used as the pipeline's primary signal;
+    ``roiic_raw`` is the same regression on unadjusted InvestedCapital, kept
+    alongside it rather than discarded - see TODO.md #4 for why the two can
+    legitimately disagree (e.g. BBWI) and why that disagreement is itself
+    worth surfacing rather than collapsing into a single number.
     """
     # Slice data for this symbol; Yahooquery upper-cases symbols already
     inc_slice = inc_df[inc_df["symbol"] == symbol]
@@ -301,15 +306,15 @@ def _process_symbol_from_batch(
     cf_slice = cf_df[cf_df["symbol"] == symbol] if cf_df is not None and not cf_df.empty and "symbol" in cf_df.columns else None
 
     if inc_slice.empty or bs_slice.empty:
-        return symbol, None, 0, "no Yahoo data"
+        return symbol, None, 0, "no Yahoo data", None
 
     # Early InvestedCapital presence check
     if "InvestedCapital" not in bs_slice.columns:
-        return symbol, None, 0, "InvestedCapital missing"
+        return symbol, None, 0, "InvestedCapital missing", None
 
     hist = compute_nopat_and_invested_capital(inc_slice, bs_slice, cf_slice)
     if hist.empty:
-        return symbol, None, 0, "historical merge empty"
+        return symbol, None, 0, "historical merge empty", None
 
     # Supplement with baseline year if useful
     if baseline_data is not None:
@@ -324,12 +329,16 @@ def _process_symbol_from_batch(
                             "year": [year],
                             "nopat": [base_row["nopat"].iloc[0]],
                             "InvestedCapital": [base_row["InvestedCapital"].iloc[0]],
+                            "InvestedCapital_organic": [base_row["InvestedCapital"].iloc[0]],
                         }
                     ),
                 ], ignore_index=True)
 
-    roiic, reason = compute_roiic_slope(hist, with_reason=True)
-    return symbol, roiic, len(hist), reason
+    roiic, reason = compute_roiic_slope(hist[["year", "nopat", "InvestedCapital_organic"]].rename(
+        columns={"InvestedCapital_organic": "InvestedCapital"}
+    ), with_reason=True)
+    roiic_raw, _ = compute_roiic_slope(hist[["year", "nopat", "InvestedCapital"]], with_reason=True)
+    return symbol, roiic, len(hist), reason, roiic_raw
 
 
 def fetch_annual_data(symbol: str, delay_ref: List[float]) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -427,13 +436,23 @@ def compute_nopat_and_invested_capital(
     # Extract year from asOfDate for regression
     merged["year"] = pd.to_datetime(merged["asOfDate"]).dt.year
 
+    # Keep BOTH the raw and buyback-adjusted ("organic") InvestedCapital -
+    # they can diverge sharply for heavy-buyback names (see TODO.md #4), and
+    # that divergence is itself informative rather than something to collapse
+    # into one number: it flags names whose incremental-capital story hinges
+    # on a judgment call about whether the buybacks were prudent capital
+    # discipline or value-destructive, which this pipeline can't resolve on
+    # its own.
     if buyback_by_date:
         merged = merged.sort_values("asOfDate").reset_index(drop=True)
         merged["RepurchaseOfCapitalStock"] = merged["asOfDate"].map(buyback_by_date)
         merged = apply_buyback_addback(merged)
-        merged["InvestedCapital"] = merged["InvestedCapital_organic"]
+    else:
+        merged["InvestedCapital_organic"] = merged["InvestedCapital"]
 
-    return merged[["year", "nopat", "InvestedCapital"]].dropna()
+    return merged[["year", "nopat", "InvestedCapital", "InvestedCapital_organic"]].dropna(
+        subset=["year", "nopat", "InvestedCapital"]
+    )
 
 
 def compute_roiic_slope(data: pd.DataFrame, *, with_reason: bool = False) -> Optional[float] | tuple[Optional[float], str | None]:
@@ -700,13 +719,13 @@ def main():
 
         for sym in chunk:
             print(f"  · Processing {sym}...", flush=True)
-            sym_r, roiic, pts, reason = _process_symbol_from_batch(sym, inc_df, bs_df, baseline_data, cf_df)
+            sym_r, roiic, pts, reason, roiic_raw = _process_symbol_from_batch(sym, inc_df, bs_df, baseline_data, cf_df)
             if roiic is not None:
-                print(f"    ROIIC: {roiic:.4f} ({pts} pts)")
+                print(f"    ROIIC: {roiic:.4f} ({pts} pts, raw={roiic_raw})")
             else:
                 print(f"    Skipped – {reason}")
 
-            results.append({"symbol": sym_r, "roiic": roiic, "data_points_used": pts})
+            results.append({"symbol": sym_r, "roiic": roiic, "roiic_raw": roiic_raw, "data_points_used": pts})
 
     results_df = pd.DataFrame(results)
     

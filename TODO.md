@@ -58,6 +58,30 @@ power-limit note below, don't over-read the ranking):
   snapshot to change definition too for consistency; bigger blast radius
   than warranted right now.
 
+  **Refinement: report both raw and organic ROIIC, don't collapse to one
+  number.** The addback can only ever make a heavy-buyback name look worse
+  or unchanged (never artificially better - adding back buybacks only ever
+  grows the reconstructed IC), and it implicitly assumes returned cash would
+  have earned an operating return if retained - true if the buyback crowded
+  out real reinvestment, false if it was genuinely excess/idle cash with no
+  good internal use. That assumption can't be verified from the data alone
+  (see BBWI: -44% organic growthGate vs. unmeasurable raw - the whole
+  reading exists only because of the buyback-adjustment assumption, with no
+  independent corroboration). Fix: `compute_nopat_and_invested_capital()`
+  now returns both `InvestedCapital` (raw) and `InvestedCapital_organic`;
+  `_process_symbol_from_batch()` and `sec_edgar_backtest.py`'s
+  `process_ticker()` compute and return both `roiic`/`roiic_raw` (and
+  `growthGate`/`growthGate_raw`) rather than only the organic one.
+  `roiic_top.csv` now has a `roiic_raw` column alongside `roiic`. How to
+  read the pair: **agree** (same sign) → robust, trust it regardless of the
+  buyback-quality question; **one-sided** (raw unmeasurable, only organic
+  exists - e.g. BBWI, NTAP) → the signal is entirely a construct of the
+  buyback assumption, corroborate against outside information (news,
+  guidance) before trusting it; **sign flip** (e.g. EXEL: +26.6% organic vs.
+  -47.1% raw; EXPD: -19.9% organic vs. +33.0% raw) → genuinely unresolved,
+  needs qualitative research into how/why the company bought back stock,
+  not a number to act on either way.
+
 - **#3 — Theil-Sen instead of OLS for the regression slope.** Swapped
   `stats.linregress` for `stats.theilslopes` in `compute_roiic_slope()`
   (both `nopat` and `InvestedCapital` vs. `year`) - same target quantity as
