@@ -467,15 +467,19 @@ def compute_roiic_slope(data: pd.DataFrame, *, with_reason: bool = False) -> Opt
     if ic_first == 0 or abs(ic_last - ic_first) / abs(ic_first) < 0.10:
         return (None, "ΔIC/IC₀ < 10 %") if with_reason else None
 
-    # Fit linear regression: y = slope * x + intercept
+    # Fit slope via Theil-Sen: the median of the pairwise slope between every
+    # two years in the window, rather than OLS's squared-error-minimizing
+    # line. Same target quantity (marginal NOPAT per unit of marginal
+    # InvestedCapital), just far less swayed by a single noisy year - see
+    # TODO.md #3. Note theilslopes takes (y, x), the reverse of linregress.
     try:
-        nopat_slope, _, _, _, _ = stats.linregress(years, nopat)
-        ic_slope, _, _, _, _ = stats.linregress(years, invested_capital)
-        
+        nopat_slope, _, _, _ = stats.theilslopes(nopat, years)
+        ic_slope, _, _, _ = stats.theilslopes(invested_capital, years)
+
         # Avoid division by zero (but negative denominators are valid)
         if ic_slope == 0:
             return (None, "IC slope = 0") if with_reason else None
-            
+
         roiic_raw = nopat_slope / ic_slope
 
         # ------------------------------------------------------------------

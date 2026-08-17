@@ -2,9 +2,20 @@
 
 Context: `compute_roiic.py`'s ROIIC regression looked weak in the SEC-EDGAR
 point-in-time backtest (`sec_edgar_backtest.py`, `--years-ago 5`). Diagnosis
-and a 5-step improvement plan came out of that review; steps 1 and 4 are
-built. Steps 2/3/5 are parked here for later — not abandoned, just not
-proven to move the needle yet (see "why paused" below).
+and a 5-step improvement plan came out of that review; steps 1, 3, and 4 are
+built. Steps 2/5 are parked here for later — not abandoned, just not proven
+to move the needle yet (see "why paused" below).
+
+Backtest scorecard across all three built fixes (5yr anchor, n=32 clean
+names; none of these gaps clear statistical significance — see the harness
+power-limit note below, don't over-read the ranking):
+
+| Version | qual-vs-disqual gap | p-value | ROIIC computable | clamped |
+|---|---|---|---|---|
+| Original | +101.1% | 0.308 | 29/32 | 12/29 (41%) |
+| +#1 normalize | +80.8% | 0.393 | 29/32 | 13/29 (45%) |
+| +#1+#4 buyback | +103.9% | 0.269 | 31/32 | 2/31 (6%) |
+| +#1+#4+#3 Theil-Sen | +128.3% | 0.197 | 31/32 | 4/31 (13%) |
 
 ## Done
 
@@ -47,21 +58,33 @@ proven to move the needle yet (see "why paused" below).
   snapshot to change definition too for consistency; bigger blast radius
   than warranted right now.
 
+- **#3 — Theil-Sen instead of OLS for the regression slope.** Swapped
+  `stats.linregress` for `stats.theilslopes` in `compute_roiic_slope()`
+  (both `nopat` and `InvestedCapital` vs. `year`) - same target quantity as
+  before (marginal NOPAT per unit of marginal InvestedCapital), just the
+  median of every pairwise slope instead of a squared-error-minimizing fit,
+  so a single noisy year can't dominate the estimate. Chosen deliberately
+  as the *primary* estimator, not just a diagnostic, after concluding it's
+  actually more explainable than OLS once broken down: a pairwise slope
+  between two years literally *is* two-point incremental ROIC (a concept
+  already used throughout this project), whereas OLS's "minimize squared
+  error" doesn't map to any financial intuition - the fear that Theil-Sen
+  is "abstract" was really unfamiliarity with the method, not the concept
+  underneath it. `sec_edgar_backtest.py` picked this up automatically
+  (imports `compute_roiic_slope` directly, no separate wiring needed).
+  Verified against GE: previously -8.2% (OLS+buyback-adjusted), now +3.1%
+  (Theil-Sen) - a concrete example of the median-of-pairwise-slopes
+  correctly down-weighting one outlier year-pair that was dominating the
+  OLS fit. All existing unit tests still pass.
+
 ## Backlog (not built)
 
 - **#2 — Confidence flag alongside `growthGate`.** Surface whether the
-  ROIIC regression hit the ±40% winsorization clamp (or expose R²), so a
-  noisy/clamped reading can be weighted down instead of trusted at face
-  value. Cheap to add once the others are in — do it last. (Less urgent
-  now that #4 dropped the clamp rate from ~45% to ~6%, but still worth
-  doing for the residual cases and for #3/#5 below.)
-
-- **#3 — Theil-Sen instead of OLS for the regression slope.** Same target
-  quantity as today (marginal NOPAT per unit of marginal InvestedCapital),
-  just estimated as the median of pairwise slopes instead of least-squares
-  — far less sensitive to a single outlier year. `scipy.stats.theilslopes`
-  is close to a drop-in replacement for the existing `stats.linregress`
-  calls in `compute_roiic_slope()`.
+  ROIIC regression hit the ±40% winsorization clamp (or expose the spread
+  between the low/high Theil-Sen slope bounds `stats.theilslopes` already
+  returns - free extra info now that we're using it), so a noisy/clamped
+  reading can be weighted down instead of trusted at face value. Cheap to
+  add - do it whenever the clamp rate (now 4/31, 13%) becomes annoying.
 
 - **#5 — Lag InvestedCapital vs. NOPAT in the regression.** Fit
   InvestedCapital(t-1) → NOPAT(t) instead of the current same-year fit,
