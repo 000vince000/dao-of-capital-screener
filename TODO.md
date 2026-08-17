@@ -103,6 +103,30 @@ power-limit note below, don't over-read the ranking):
 
 ## Backlog (not built)
 
+- **#6 — Wire quarterly TTM normalization into `current_baseline_data.py`'s
+  ROIC snapshot (fixes MRK's false thesis-break).** #1's `normalize_annual_series()`
+  only touches `compute_roiic.py`'s annual ROIIC regression - the quarterly
+  TTM EBIT that `current_baseline_data.py` uses for the primary ROIC/
+  excessReturn snapshot (the actual "is the thesis still intact" check) is
+  never normalized, so MRK still shows a false THESIS BROKEN (-1.6%
+  excessReturn) even after tonight's fixes; the real number is ~+13.5%
+  once the Mar/Jun'26 R&D-charge quarters are corrected (`normalize_ebit.py`
+  already proves this manually). Fix is cheap: the quarterly (`"3M"`)
+  income-statement rows `normalize_ebit.py` needs are already fetched by
+  `current_baseline_data.py`'s existing `income_statement(frequency="q")`
+  call - `_fetch_batch_data` just discards them, keeping only `"TTM"` rows,
+  so no extra API calls needed. Plan: extract `normalize_ebit.py`'s
+  `_flag_and_normalize` into a clean, side-effect-free function in
+  `compute_roiic.py` (can't import `normalize_ebit.py` directly -
+  it patches yahooquery's session at module-import time as an
+  environment-specific workaround, which would be dangerous to pull into
+  the production pipeline elsewhere), wire it into
+  `_compute_financial_metrics`'s EBIT/nopat calc using the `"3M"` rows
+  before computing `roic`. Also worth noting for context: confirmed the
+  problem does NOT self-resolve quickly - MRK's TTM window won't fully
+  clear both distorted quarters (Mar'26, Jun'26) until the Q2 2027 earnings
+  report, roughly a year out, so this isn't a "wait it out" situation.
+
 - **#2 — Confidence flag alongside `growthGate`.** Surface whether the
   ROIIC regression hit the ±40% winsorization clamp (or expose the spread
   between the low/high Theil-Sen slope bounds `stats.theilslopes` already
