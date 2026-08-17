@@ -74,7 +74,7 @@ sm.initialize_session = _non_impersonated_session
 _yq_base.initialize_session = _non_impersonated_session
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from compute_roiic import compute_roiic_slope, normalize_annual_series  # reuse the exact same logic as the live pipeline
+from compute_roiic import compute_roiic_slope, normalize_annual_series, apply_buyback_addback  # reuse the exact same logic as the live pipeline
 from fetch_wacc import fetch_wacc
 
 _CIK_MAP: Optional[dict] = None
@@ -287,17 +287,32 @@ def process_ticker(ticker: str, anchor_date: date, wacc: float) -> dict:
     hist_window["nopat"] = hist_window["EBIT_normalized"] * (1 - hist_window["TaxRateForCalcs_normalized"])
     hist_window["year"] = hist_window["end"].dt.year
 
+    # --- Buyback-adjusted (organic) InvestedCapital, for the ROIIC regression
+    # ONLY (TODO.md #4) - the anchor-year ROIC/excessReturn snapshot below
+    # deliberately keeps using the real, unadjusted InvestedCapital, since
+    # that reflects the business's actual current capital base. The buyback
+    # addback only cleans up the *trend* the regression fits, not the level
+    # of capital the company is genuinely operating with today. ---
+    buyback_units = _first_present(gaap, ["PaymentsForRepurchaseOfCommonStock"])
+    buyback_annual = _annual_series(buyback_units) if buyback_units else pd.DataFrame()
+    hist_window = hist_window.sort_values("end").reset_index(drop=True)
+    hist_window["RepurchaseOfCapitalStock"] = hist_window["end"].apply(lambda e: _val_for(buyback_annual, e))
+    hist_window = apply_buyback_addback(hist_window)
+
     anchor_row = hist_window[hist_window["end"] == anchor_fy_end].iloc[0]
     anchor_ebit = float(anchor_row["EBIT_normalized"])
     anchor_tax = float(anchor_row["TaxRateForCalcs_normalized"])
-    anchor_ic = float(anchor_row["InvestedCapital"])
+    anchor_ic = float(anchor_row["InvestedCapital"])  # unadjusted - real capital base at the anchor date
     if anchor_ic <= 0:
         return {"symbol": ticker, "status": "bad_invested_capital"}
 
     anchor_nopat = anchor_ebit * (1 - anchor_tax)
     anchor_roic = anchor_nopat / anchor_ic
 
-    roiic, roiic_reason = compute_roiic_slope(hist_window[["year", "nopat", "InvestedCapital"]], with_reason=True)
+    regression_input = hist_window[["year", "nopat", "InvestedCapital_organic"]].rename(
+        columns={"InvestedCapital_organic": "InvestedCapital"}
+    )
+    roiic, roiic_reason = compute_roiic_slope(regression_input, with_reason=True)
 
     excess_return = anchor_roic - wacc
     growth_gate = (roiic - wacc) if roiic is not None else None

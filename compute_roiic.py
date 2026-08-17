@@ -177,17 +177,62 @@ def normalize_annual_series(df: pd.DataFrame, spike_multiple: float = 2.0) -> pd
 
     return d
 
+
+def apply_buyback_addback(df: pd.DataFrame, *, ic_col: str = "InvestedCapital", buyback_col: str = "RepurchaseOfCapitalStock") -> pd.DataFrame:
+    """Add back cumulative share buybacks to InvestedCapital before it feeds
+    the ROIIC regression (TODO.md #4).
+
+    A buyback pays cash to shareholders and shrinks equity (via treasury
+    stock), reducing InvestedCapital = Debt + Equity - Cash on *both* legs,
+    even though it has zero effect on the operating assets (PP&E, working
+    capital) that actually generate NOPAT. Left uncorrected, buyback-heavy
+    but genuinely growing businesses can show a flat or shrinking IC trend
+    that either trips the "ΔIC/IC₀ < 10%" filter (silently dropping the
+    ROIIC signal entirely - this happened to IT, NTAP, BBWI, WMT, PFE) or
+    biases the regression slope on a financing decision rather than the
+    operating economics ROIIC is meant to measure.
+
+    Fix: add back the cumulative buyback spend, from the first row of the
+    given window onward, to InvestedCapital each year - reconstructing what
+    IC would have been had that cash never been returned to shareholders.
+    This never touches NOPAT (buybacks don't affect operating profit), so it
+    isolates the piece of IC that actually correlates with what generates
+    NOPAT, at the cost of not correcting for other financing-side noise
+    (debt-funded dividends, M&A/goodwill swings) - see TODO.md for why that
+    bigger fix (rebuilding IC from the asset side) was deferred.
+
+    Rows must be pre-sorted chronologically (oldest first). buyback_col is
+    read as a magnitude (sign-agnostic - abs() applied), 0/NaN treated as no
+    buyback that period. Returns the same rows plus '{ic_col}_organic'.
+    """
+    d = df.copy().reset_index(drop=True)
+    organic_col = f"{ic_col}_organic"
+    if ic_col not in d.columns:
+        return d
+    ic_numeric = pd.to_numeric(d[ic_col], errors="coerce")
+    if buyback_col not in d.columns:
+        d[organic_col] = ic_numeric
+        return d
+    magnitude = pd.to_numeric(d[buyback_col], errors="coerce").abs().fillna(0.0)
+    cumulative_buyback = magnitude.cumsum()
+    d[organic_col] = ic_numeric + cumulative_buyback
+    return d
+
 # --------------------------------------------------------------------------------------
 # Batch-fetch helpers
 # --------------------------------------------------------------------------------------
 
 
-def _batch_fetch_annual(symbols: list[str], delay_ref: list[float]) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Return (income_df, balance_df) for *symbols* using one Yahooquery call.
+def _batch_fetch_annual(symbols: list[str], delay_ref: list[float]) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Return (income_df, balance_df, cashflow_df) for *symbols* using one Yahooquery call.
 
-    Both DataFrames are indexed by ``symbol`` and contain **all** rows returned by
+    All DataFrames are indexed by ``symbol`` and contain **all** rows returned by
     Yahoo.  If the request fails with a non-rate-limit error we propagate the
     exception so the caller can decide how to handle it.
+
+    cashflow_df feeds apply_buyback_addback() (TODO.md #4) - a failure fetching
+    it is non-fatal (falls back to an empty frame), since the buyback
+    adjustment gracefully no-ops without it.
     """
 
     ticker = Ticker(symbols, asynchronous=True)
@@ -204,14 +249,27 @@ def _batch_fetch_annual(symbols: list[str], delay_ref: list[float]) -> tuple[pd.
         delay_ref=delay_ref,
     )
 
+    try:
+        cashflow_df = fetch_with_backoff(
+            lambda: ticker.cash_flow(frequency="a"),
+            desc=f"annual cash flow batch {len(symbols)} syms",
+            delay_ref=delay_ref,
+        )
+    except RateLimitExceeded:
+        raise
+    except Exception:
+        cashflow_df = pd.DataFrame()
+
     # Ensure DataFrame shape even on single-symbol batches
     if not isinstance(income_df, pd.DataFrame):
         income_df = pd.DataFrame()
     if not isinstance(balance_df, pd.DataFrame):
         balance_df = pd.DataFrame()
+    if not isinstance(cashflow_df, pd.DataFrame):
+        cashflow_df = pd.DataFrame()
 
     # Yahooquery sometimes returns multi-index (symbol, asOfDate). Reset index for easier slicing.
-    for df in (income_df, balance_df):
+    for df in (income_df, balance_df, cashflow_df):
         if isinstance(df.index, pd.MultiIndex):
             df.reset_index(level=0, inplace=True)
         elif "symbol" not in df.columns:
@@ -223,7 +281,7 @@ def _batch_fetch_annual(symbols: list[str], delay_ref: list[float]) -> tuple[pd.
         if df.index.name == "symbol":  # rare case
             df.reset_index(inplace=True)
 
-    return income_df, balance_df
+    return income_df, balance_df, cashflow_df
 
 
 def _process_symbol_from_batch(
@@ -231,6 +289,7 @@ def _process_symbol_from_batch(
     inc_df: pd.DataFrame,
     bs_df: pd.DataFrame,
     baseline_data: Optional[pd.DataFrame],
+    cf_df: Optional[pd.DataFrame] = None,
 ) -> tuple[str, Optional[float], int, str | None]:
     """Compute ROIIC for *symbol* using already-fetched DataFrames.
 
@@ -239,6 +298,7 @@ def _process_symbol_from_batch(
     # Slice data for this symbol; Yahooquery upper-cases symbols already
     inc_slice = inc_df[inc_df["symbol"] == symbol]
     bs_slice = bs_df[bs_df["symbol"] == symbol]
+    cf_slice = cf_df[cf_df["symbol"] == symbol] if cf_df is not None and not cf_df.empty and "symbol" in cf_df.columns else None
 
     if inc_slice.empty or bs_slice.empty:
         return symbol, None, 0, "no Yahoo data"
@@ -247,7 +307,7 @@ def _process_symbol_from_batch(
     if "InvestedCapital" not in bs_slice.columns:
         return symbol, None, 0, "InvestedCapital missing"
 
-    hist = compute_nopat_and_invested_capital(inc_slice, bs_slice)
+    hist = compute_nopat_and_invested_capital(inc_slice, bs_slice, cf_slice)
     if hist.empty:
         return symbol, None, 0, "historical merge empty"
 
@@ -293,11 +353,21 @@ def fetch_annual_data(symbol: str, delay_ref: List[float]) -> Tuple[pd.DataFrame
     return income_annual, balance_annual
 
 
-def compute_nopat_and_invested_capital(income_df: pd.DataFrame, balance_df: pd.DataFrame, *, normalize: bool = True) -> pd.DataFrame:
+def compute_nopat_and_invested_capital(
+    income_df: pd.DataFrame,
+    balance_df: pd.DataFrame,
+    cashflow_df: Optional[pd.DataFrame] = None,
+    *,
+    normalize: bool = True,
+    adjust_buybacks: bool = True,
+) -> pd.DataFrame:
     """Compute NOPAT and InvestedCapital for annual data points.
 
     normalize: apply normalize_annual_series() to the EBIT/tax inputs first
     (default True). Set False to reproduce the pre-normalization behaviour.
+    adjust_buybacks: apply apply_buyback_addback() to InvestedCapital when
+    cashflow_df is supplied (default True; no-ops if cashflow_df is None or
+    lacks a RepurchaseOfCapitalStock column - see TODO.md #4).
     """
     # Filter for the symbol and merge on asOfDate
     if income_df.empty or balance_df.empty:
@@ -317,6 +387,15 @@ def compute_nopat_and_invested_capital(income_df: pd.DataFrame, balance_df: pd.D
     # Get the most recent 8 years of data (to have enough points)
     income_recent = income_annual_only.sort_values("asOfDate").tail(8)
     balance_recent = balance_annual_only.sort_values("asOfDate").tail(8)
+
+    buyback_by_date: dict = {}
+    if adjust_buybacks and cashflow_df is not None and not cashflow_df.empty:
+        cf = cashflow_df
+        if 'periodType' in cf.columns:
+            cf = cf[cf['periodType'] == '12M']
+        if 'RepurchaseOfCapitalStock' in cf.columns:
+            cf_recent = cf.sort_values("asOfDate").tail(8)
+            buyback_by_date = dict(zip(cf_recent["asOfDate"], cf_recent["RepurchaseOfCapitalStock"]))
 
     if normalize and not income_recent.empty:
         norm_cols = ["asOfDate", "EBIT", "TaxRateForCalcs"] + [
@@ -344,10 +423,16 @@ def compute_nopat_and_invested_capital(income_df: pd.DataFrame, balance_df: pd.D
     
     # Compute NOPAT = EBIT * (1 - TaxRate)
     merged["nopat"] = merged["EBIT"] * (1 - merged["TaxRateForCalcs"])
-    
+
     # Extract year from asOfDate for regression
     merged["year"] = pd.to_datetime(merged["asOfDate"]).dt.year
-    
+
+    if buyback_by_date:
+        merged = merged.sort_values("asOfDate").reset_index(drop=True)
+        merged["RepurchaseOfCapitalStock"] = merged["asOfDate"].map(buyback_by_date)
+        merged = apply_buyback_addback(merged)
+        merged["InvestedCapital"] = merged["InvestedCapital_organic"]
+
     return merged[["year", "nopat", "InvestedCapital"]].dropna()
 
 
@@ -598,7 +683,7 @@ def main():
         print(f"Fetching batch {start + 1}–{start + len(chunk)} / {len(symbols)}", flush=True)
 
         try:
-            inc_df, bs_df = _batch_fetch_annual(chunk, delay_ref)
+            inc_df, bs_df, cf_df = _batch_fetch_annual(chunk, delay_ref)
         except RateLimitExceeded:
             print("❌ Rate limit exceeded during batch fetch – aborting", flush=True)
             break
@@ -611,7 +696,7 @@ def main():
 
         for sym in chunk:
             print(f"  · Processing {sym}...", flush=True)
-            sym_r, roiic, pts, reason = _process_symbol_from_batch(sym, inc_df, bs_df, baseline_data)
+            sym_r, roiic, pts, reason = _process_symbol_from_batch(sym, inc_df, bs_df, baseline_data, cf_df)
             if roiic is not None:
                 print(f"    ROIIC: {roiic:.4f} ({pts} pts)")
             else:

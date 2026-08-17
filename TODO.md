@@ -2,9 +2,9 @@
 
 Context: `compute_roiic.py`'s ROIIC regression looked weak in the SEC-EDGAR
 point-in-time backtest (`sec_edgar_backtest.py`, `--years-ago 5`). Diagnosis
-and a 5-step improvement plan came out of that review; only step 1 has been
-built. Steps 2-5 are parked here for later — not abandoned, just not proven
-to move the needle yet (see "why paused" below).
+and a 5-step improvement plan came out of that review; steps 1 and 4 are
+built. Steps 2/3/5 are parked here for later — not abandoned, just not
+proven to move the needle yet (see "why paused" below).
 
 ## Done
 
@@ -19,12 +19,42 @@ to move the needle yet (see "why paused" below).
   one-time gain, a PG data-quality bug it also caught). All existing unit
   tests still pass.
 
+- **#4 — Buyback-adjusted (organic) InvestedCapital.** A share buyback
+  shrinks equity/cash with zero effect on the operating business, which
+  distorted the ΔIC trend the regression relies on. Implemented as
+  `apply_buyback_addback()` in `compute_roiic.py`: adds back cumulative
+  `RepurchaseOfCapitalStock` (yahooquery) / `PaymentsForRepurchaseOfCommonStock`
+  (SEC) to InvestedCapital before it feeds `compute_roiic_slope()` — applied
+  **only** to the regression window, deliberately not to the anchor-year
+  ROIC/excessReturn snapshot (a bug where it leaked into the snapshot was
+  caught and fixed in `sec_edgar_backtest.py`: it had inflated AAPL's
+  anchor InvestedCapital to $512B, cutting its real ~42% ROIC down to a
+  fake ~11%). Wired into `compute_roiic.py`'s live batch path (added a
+  `cash_flow` fetch alongside income/balance) and mirrored in
+  `sec_edgar_backtest.py`. Verified against real filings: AAPL went from
+  an unmeasurable ROIIC (flat IC, masked by ~$90B/year buybacks) to a real
+  +5.3%; GE went from a strong -29.6% (partly buyback, partly unrelated
+  spinoff noise this fix doesn't touch) to unmeasurable, which is the more
+  honest outcome given the fix only corrects the buyback piece. In the
+  5-year backtest, ROIIC's ±40% clamp rate dropped from 41-45% of computed
+  values down to 6% — the clearest evidence either fix worked, since the
+  aggregate qualifiers-vs-disqualified return gap remains statistically
+  insignificant either way (p≈0.27-0.39 throughout, per the harness
+  power-limit note below) and shouldn't be over-read turn to turn.
+  Considered and rejected for now: rebuilding InvestedCapital from the
+  operating/asset side (PP&E + working capital) — more comprehensive (also
+  fixes M&A distortion) but would force `current_baseline_data.py`'s ROIC
+  snapshot to change definition too for consistency; bigger blast radius
+  than warranted right now.
+
 ## Backlog (not built)
 
 - **#2 — Confidence flag alongside `growthGate`.** Surface whether the
   ROIIC regression hit the ±40% winsorization clamp (or expose R²), so a
   noisy/clamped reading can be weighted down instead of trusted at face
-  value. Cheap to add once the others are in — do it last.
+  value. Cheap to add once the others are in — do it last. (Less urgent
+  now that #4 dropped the clamp rate from ~45% to ~6%, but still worth
+  doing for the residual cases and for #3/#5 below.)
 
 - **#3 — Theil-Sen instead of OLS for the regression slope.** Same target
   quantity as today (marginal NOPAT per unit of marginal InvestedCapital),
@@ -32,20 +62,6 @@ to move the needle yet (see "why paused" below).
   — far less sensitive to a single outlier year. `scipy.stats.theilslopes`
   is close to a drop-in replacement for the existing `stats.linregress`
   calls in `compute_roiic_slope()`.
-
-- **#4 — Buyback-adjusted (organic) InvestedCapital.** A share buyback
-  shrinks equity/cash with zero effect on the operating business, which
-  distorts the ΔIC trend the regression relies on. Fix: add back
-  cumulative `RepurchaseOfCapitalStock` (SEC) / equivalent cash-flow field
-  (yahooquery) to the equity series before computing InvestedCapital per
-  year, rather than the current all-or-nothing `ΔIC/IC₀ < 10%` filter that
-  just drops capital-light/buyback-heavy names (IT, NTAP, BBWI, WMT, PFE
-  all lost their ROIIC signal entirely this way in testing). Considered and
-  rejected for now: rebuilding InvestedCapital from the operating/asset
-  side (PP&E + working capital) — more comprehensive (also fixes M&A
-  distortion) but would force `current_baseline_data.py`'s ROIC snapshot
-  to change definition too for consistency; bigger blast radius than
-  warranted right now.
 
 - **#5 — Lag InvestedCapital vs. NOPAT in the regression.** Fit
   InvestedCapital(t-1) → NOPAT(t) instead of the current same-year fit,
