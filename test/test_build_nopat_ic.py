@@ -87,6 +87,37 @@ class TestComputeRebuiltNopat(unittest.TestCase):
         result = m.compute_rebuilt_nopat(row_inc, row_cf)
         self.assertIsNone(result["nopat_rebuilt"])
 
+    def test_asset_impairment_charge_is_added_back(self):
+        # WBD's real FY2024 AssetImpairmentCharge ($9.603B), cross-checked
+        # this session against their reported $9.1B Networks-segment
+        # goodwill impairment (see build_nopat_ic.py docstring). Confirms
+        # the add-back is wired in and the dollar amount is surfaced, not
+        # just silently folded into NOPAT.
+        row_inc = pd.Series({
+            "OperatingIncome": 10e9, "TaxProvision": 1e9,
+            "InterestExpense": 0.0, "InterestIncome": 0.0,
+        })
+        row_cf = pd.Series({"DeferredIncomeTax": 0.0, "AssetImpairmentCharge": 9.603e9})
+
+        result = m.compute_rebuilt_nopat(row_inc, row_cf)
+        self.assertAlmostEqual(result["asset_impairment_addback"], 9.603e9, delta=1e6)
+        # nopat = operating_income - cash_taxes + addback = 10e9 - 1e9 + 9.603e9
+        self.assertAlmostEqual(result["nopat_rebuilt"], 18.603e9, delta=1e6)
+
+    def test_no_impairment_year_defaults_cleanly_to_zero(self):
+        # NaN/missing AssetImpairmentCharge means "no impairment reported
+        # that year" (confirmed against MSFT, which returns NaN here) - a
+        # legitimate zero, not missing data, so this must NOT return None.
+        row_inc = pd.Series({
+            "OperatingIncome": 10e9, "TaxProvision": 1e9,
+            "InterestExpense": 0.0, "InterestIncome": 0.0,
+        })
+        row_cf = pd.Series({"DeferredIncomeTax": 0.0})  # no AssetImpairmentCharge key at all
+
+        result = m.compute_rebuilt_nopat(row_inc, row_cf)
+        self.assertEqual(result["asset_impairment_addback"], 0.0)
+        self.assertAlmostEqual(result["nopat_rebuilt"], 9e9, delta=1e6)
+
 
 class TestComputeRebuiltInvestedCapital(unittest.TestCase):
     def test_matches_paper_exhibit4_msft_fy2022_excluding_lease_rou(self):

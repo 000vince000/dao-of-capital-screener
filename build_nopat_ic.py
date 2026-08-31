@@ -51,6 +51,38 @@ NOPAT = EBITA - cash taxes, built as:
                                       x STATUTORY_TAX_RATE. The paper wants a
                                       marginal/statutory rate here, not the
                                       reported effective rate.
+  * + Goodwill/intangible
+      impairment add-back         -> AssetImpairmentCharge (annual cash_flow
+                                      statement). The paper: "It is standard
+                                      to add back goodwill and intangible
+                                      impairment charges... management should
+                                      be held accountable for past capital
+                                      allocation decisions." Cross-checked
+                                      against real filings this session, not
+                                      assumed from the field name: KHC's 2025
+                                      value ($9.306B) matches their reported
+                                      $6.7B goodwill + $2.6B intangible
+                                      impairment ($9.3B combined) almost
+                                      exactly; WBD's 2024 value ($9.603B) is
+                                      close to their reported $9.1B Networks
+                                      goodwill impairment (the ~5% gap is
+                                      plausibly other smaller impairments
+                                      bundled into the same field). Caveat:
+                                      the field is named generically ("asset"
+                                      impairment, not "goodwill" impairment)
+                                      so it may occasionally include non-
+                                      goodwill/intangible write-downs (e.g.
+                                      PP&E) - not confirmed goodwill-only,
+                                      just confirmed goodwill-dominated for
+                                      the two names checked. NaN in this
+                                      field means "no impairment reported
+                                      that year" (confirmed: MSFT, which
+                                      hasn't had one recently, returns NaN
+                                      here) - a legitimate zero, not missing
+                                      data, so it safely defaults to 0.0
+                                      (unlike DeferredIncomeTax/interest
+                                      fields above, where NaN genuinely means
+                                      "unknown").
 
 InvestedCapital (operating approach - the side the paper itself recommends):
   * Current assets - NIBCLs       -> CurrentAssets - (CurrentLiabilities - CurrentDebt)
@@ -114,6 +146,9 @@ ADJUSTMENTS_ALWAYS_SKIPPED = (
     "amortization_addback,lease_interest_addback,lease_rou_asset,"
     "tax_provision_unusual_item_adjustment"
 )
+# asset_impairment_addback is NOT in this list — it's applied (see
+# compute_rebuilt_nopat), with the per-row dollar amount surfaced in the
+# "asset_impairment_addback" output column so it's auditable, not hidden.
 
 
 def _safe_num(value, default: float = 0.0) -> float:
@@ -217,14 +252,22 @@ def compute_rebuilt_nopat(row_inc: pd.Series, row_cf: pd.Series) -> dict:
     deferred_income_tax = row_cf.get("DeferredIncomeTax")
     interest_expense = _safe_num(row_inc.get("InterestExpense"))
     interest_income = _safe_num(row_inc.get("InterestIncome"))
+    # NaN here means "no impairment reported that year" (a legitimate zero,
+    # confirmed against MSFT), unlike the NaN checks below which mean
+    # "genuinely unknown" — see module docstring.
+    asset_impairment_addback = _safe_num(row_cf.get("AssetImpairmentCharge"))
 
     if pd.isna(operating_income) or pd.isna(tax_provision) or pd.isna(deferred_income_tax):
-        return {"nopat_rebuilt": None, "cash_taxes": None}
+        return {"nopat_rebuilt": None, "cash_taxes": None, "asset_impairment_addback": None}
 
     net_interest_expense = interest_expense - interest_income
     cash_taxes = compute_cash_taxes(tax_provision, deferred_income_tax, net_interest_expense)
-    nopat = operating_income - cash_taxes
-    return {"nopat_rebuilt": nopat, "cash_taxes": cash_taxes}
+    nopat = operating_income - cash_taxes + asset_impairment_addback
+    return {
+        "nopat_rebuilt": nopat,
+        "cash_taxes": cash_taxes,
+        "asset_impairment_addback": asset_impairment_addback,
+    }
 
 
 def compute_rebuilt_invested_capital(row_bs: pd.Series, row_inc: pd.Series,
@@ -266,6 +309,7 @@ def compute_rebuilt_regime(row_inc: pd.Series, row_bs: pd.Series, row_cf: pd.Ser
         "nopat_rebuilt": nopat,
         "invested_capital_rebuilt": ic,
         "roic_rebuilt": roic,
+        "asset_impairment_addback": nopat_result.get("asset_impairment_addback"),
         "adjustments_skipped": ADJUSTMENTS_ALWAYS_SKIPPED,
     }
 
