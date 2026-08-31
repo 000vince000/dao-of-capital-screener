@@ -145,6 +145,55 @@ and contains:
 `roiic`, `valueMetric`, `valueMetricRank`, `excessReturn`,
 `excessReturnRank`, `rankingScore`, `roiicSpread`.
 
+## How to use ROIIC
+
+Consolidated in one place since the guidance was otherwise scattered across
+this README, `TODO.md`, and conversation history that doesn't survive
+between sessions.
+
+**Use it for:** a directional read on whether incremental reinvestment is
+still working — is the marginal dollar of new capital earning a good
+return, or has growth run into diminishing returns. Track the *trend*
+across quarters, not a single snapshot.
+
+**Don't use it for:** a precision value-creation measure, and never compare
+it directly to WACC as if it were ROIC (`roiicSpread` exists as a renamed,
+demoted version of this exact mistake — see Stage 5 above). Per Mauboussin
+& Callahan (References below), ROIIC overstates value creation when
+positive and understates it when negative, since it ignores the return on
+the existing, much larger capital base.
+
+**Reading `roiic` vs `roiic_raw`** (the buyback-adjusted/organic pair —
+see `TODO.md`'s item #4 for the full mechanics): agree (same sign) → robust,
+trust it regardless of the buyback-quality question; one-sided (only one of
+the pair is measurable, e.g. BBWI) → the signal only exists because of the
+buyback-adjustment assumption, corroborate against outside information
+before trusting it; sign flip → genuinely unresolved, needs qualitative
+research into *why* the company bought back stock, not a number to act on
+either way.
+
+**A high absolute ROIC/ROIIC deserves extra scrutiny, not extra
+enthusiasm.** The paper's own empirical data (Exhibit 5/9) shows extreme
+ROIC statistically regresses toward the mean — this pipeline has no
+built-in mechanism to flag "this number is unusually high," so treat
+top-decile-looking readings as a manual caution flag, not a pure positive.
+Real case (this session): IT/DECK/BBWI all sat at 25-96%+ rebuilt ROIC and
+still declined sharply — the historical ROIC wasn't wrong, but extremity by
+itself said nothing about whether it would persist.
+
+**Watch for ROIC staying high while ROIIC falls.** That combination means
+the *existing* capital base still earns well, but *new* investment isn't
+finding the same opportunities anymore — a forward-looking warning sign
+worth investigating even when the trailing snapshot still looks great.
+
+**None of this can see demand deceleration, brand erosion, or
+business-model disruption coming** — those live in growth trends, NPS/brand
+data, competitive dynamics, and litigation/governance red flags, not in
+historical NOPAT/InvestedCapital. A cheap `valueMetric` plus a strong `roic`
+is a first-stage filter (worth investigating further), not a standalone buy
+signal — pair it with qualitative research on whether the growth/demand
+trajectory is actually intact before trusting it.
+
 ## Standalone comparison tools
 
 Not part of the orchestrated `main.py` pipeline — run manually as a second
