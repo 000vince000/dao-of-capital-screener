@@ -7,7 +7,7 @@ Steps:
 3. Run `normalized_austrian_screener.py` to refresh `normalized_austrian.csv`, with `current_baseline_data.csv` and `wacc_top.csv` as input.
 4. Sort `normalized_austrian.csv` by `rankingScore` ascending and pick the top *N* tickers (default 50).
 5. Run `compute_roiic.py` to refresh `roiic_top.csv`, with `normalized_austrian.csv` as input.
-6. Compute `growthGate` as roiic - wacc. This is a DIRECTIONAL signal only (is
+6. Compute `roiicSpread` as roiic - wacc. This is a DIRECTIONAL signal only (is
    reinvestment trending better or worse than the cost of capital) — per
    Mauboussin & Callahan, "Return on Invested Capital" (Morgan Stanley
    Counterpoint Global, Oct 2022), ROIIC should not be compared to WACC as a
@@ -15,7 +15,9 @@ Steps:
    creation when positive and understates it when negative, ignoring the
    return on the (much larger) existing capital base. It is NOT used to rank
    or filter the final output; `rankingScore`, built from `excessReturn`
-   (roic - wacc), is the WACC-anchored ranking metric.
+   (roic - wacc), is the WACC-anchored ranking metric. Named `roiicSpread`,
+   not `growthGate` — the earlier name implied a pass/fail threshold, which
+   is exactly the misuse this repo is deliberately avoiding.
 7. Merge the key metrics into a concise overview CSV, sorted by `rankingScore`
    ascending (best first).
 
@@ -188,11 +190,11 @@ def main() -> None:
     # Merge top tickers with ROIIC data
     merged = top_df.merge(df_roiic[["symbol", "roiic"]], on="symbol", how="left")
     
-    # Compute Growth Gate as roiic - wacc (if both available).
+    # Compute roiicSpread as roiic - wacc (if both available).
     # NOTE: directional context only, not a value-creation measure — see the
     # module docstring. Never sort or filter on this column; use rankingScore.
     if "wacc" in merged.columns and "roiic" in merged.columns:
-        merged["growthGate"] = merged["roiic"] - merged["wacc"]
+        merged["roiicSpread"] = merged["roiic"] - merged["wacc"]
 
     # Merge with baseline data to get missing columns (industry, MarketCap)
     # Note: EBIT and EnterpriseValue are already in normalized_austrian.csv
@@ -242,7 +244,7 @@ def main() -> None:
         "excessReturn",
         "excessReturnRank",
         "rankingScore",
-        "growthGate",
+        "roiicSpread",
     ]
     # Ensure all expected columns exist
     for col in cols_order:
@@ -250,7 +252,7 @@ def main() -> None:
             merged[col] = np.nan
     merged = merged[cols_order]
 
-    # Sort by rankingScore (WACC-anchored via excessReturn), not growthGate —
+    # Sort by rankingScore (WACC-anchored via excessReturn), not roiicSpread —
     # see module docstring on why roiic - wacc isn't a valid ranking metric.
     merged = merged.sort_values("rankingScore", ascending=True)
 

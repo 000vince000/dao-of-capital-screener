@@ -104,28 +104,28 @@ class TestMain(unittest.TestCase):
         msft_row = merged[merged['symbol'] == 'MSFT']
         self.assertEqual(msft_row['roiic'].iloc[0], 0.15)
 
-    def test_growth_gate_calculation(self):
-        """Test Growth Gate calculation: roiic - wacc"""
+    def test_roiic_spread_calculation(self):
+        """Test roiicSpread calculation: roiic - wacc"""
         top_df = self.sample_normalized_data.head(3)
         merged = top_df.merge(self.sample_roiic_data[["symbol", "roiic"]], on="symbol", how="left")
         
-        # Compute Growth Gate
-        merged["growthGate"] = merged["roiic"] - merged["wacc"]
+        # Compute roiicSpread
+        merged["roiicSpread"] = merged["roiic"] - merged["wacc"]
         
         # Check calculations
         # MSFT: 0.15 - 0.09 = 0.06
-        msft_growth_gate = merged[merged['symbol'] == 'MSFT']['growthGate'].iloc[0]
-        self.assertAlmostEqual(msft_growth_gate, 0.06, places=4)
+        msft_roiic_spread = merged[merged['symbol'] == 'MSFT']['roiicSpread'].iloc[0]
+        self.assertAlmostEqual(msft_roiic_spread, 0.06, places=4)
         
         # AAPL: 0.12 - 0.08 = 0.04
-        aapl_growth_gate = merged[merged['symbol'] == 'AAPL']['growthGate'].iloc[0]
-        self.assertAlmostEqual(aapl_growth_gate, 0.04, places=4)
+        aapl_roiic_spread = merged[merged['symbol'] == 'AAPL']['roiicSpread'].iloc[0]
+        self.assertAlmostEqual(aapl_roiic_spread, 0.04, places=4)
 
     def test_column_selection_and_ordering(self):
         """Test final column selection and ordering"""
         top_df = self.sample_normalized_data.head(3)
         merged = top_df.merge(self.sample_roiic_data[["symbol", "roiic"]], on="symbol", how="left")
-        merged["growthGate"] = merged["roiic"] - merged["wacc"]
+        merged["roiicSpread"] = merged["roiic"] - merged["wacc"]
         
         # Define expected column order (from main.py)
         cols_order = [
@@ -140,7 +140,7 @@ class TestMain(unittest.TestCase):
             "excessReturn",
             "excessReturnRank",
             "rankingScore",
-            "growthGate",
+            "roiicSpread",
         ]
         
         # Ensure all columns exist (fill missing with NaN)
@@ -153,16 +153,16 @@ class TestMain(unittest.TestCase):
         # Check that we have all expected columns in correct order
         self.assertEqual(list(final_df.columns), cols_order)
 
-    def test_growth_gate_sorting(self):
-        """Test sorting by Growth Gate descending (higher is better)"""
+    def test_roiic_spread_sorting(self):
+        """Test sorting by roiicSpread descending (higher is better)"""
         top_df = self.sample_normalized_data.head(3)
         merged = top_df.merge(self.sample_roiic_data[["symbol", "roiic"]], on="symbol", how="left")
-        merged["growthGate"] = merged["roiic"] - merged["wacc"]
+        merged["roiicSpread"] = merged["roiic"] - merged["wacc"]
         
-        # Sort by growthGate descending
-        sorted_df = merged.sort_values("growthGate", ascending=False)
+        # Sort by roiicSpread descending
+        sorted_df = merged.sort_values("roiicSpread", ascending=False)
         
-        # MSFT should be first (highest Growth Gate: 0.06)
+        # MSFT should be first (highest roiicSpread: 0.06)
         self.assertEqual(sorted_df.iloc[0]['symbol'], 'MSFT')
 
     def test_missing_wacc_handling(self):
@@ -174,12 +174,12 @@ class TestMain(unittest.TestCase):
         top_df = incomplete_data.head(3)
         merged = top_df.merge(self.sample_roiic_data[["symbol", "roiic"]], on="symbol", how="left")
         
-        # Growth Gate calculation should handle NaN values
-        merged["growthGate"] = merged["roiic"] - merged["wacc"]
+        # roiicSpread calculation should handle NaN values
+        merged["roiicSpread"] = merged["roiic"] - merged["wacc"]
         
-        # GOOGL should have NaN Growth Gate due to missing WACC
-        googl_growth_gate = merged[merged['symbol'] == 'GOOGL']['growthGate'].iloc[0]
-        self.assertTrue(pd.isna(googl_growth_gate))
+        # GOOGL should have NaN roiicSpread due to missing WACC
+        googl_roiic_spread = merged[merged['symbol'] == 'GOOGL']['roiicSpread'].iloc[0]
+        self.assertTrue(pd.isna(googl_roiic_spread))
 
     def test_missing_roiic_handling(self):
         """Test handling of missing ROIIC data"""
@@ -199,7 +199,7 @@ class TestMain(unittest.TestCase):
         # Create final DataFrame
         top_df = self.sample_normalized_data.head(3)
         merged = top_df.merge(self.sample_roiic_data[["symbol", "roiic"]], on="symbol", how="left")
-        merged["growthGate"] = merged["roiic"] - merged["wacc"]
+        merged["roiicSpread"] = merged["roiic"] - merged["wacc"]
         
         # Create temporary file
         with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False) as temp_file:
@@ -213,7 +213,7 @@ class TestMain(unittest.TestCase):
             read_df = pd.read_csv(temp_path, sep=';')
             self.assertEqual(len(read_df), 3)
             self.assertIn('symbol', read_df.columns)
-            self.assertIn('growthGate', read_df.columns)
+            self.assertIn('roiicSpread', read_df.columns)
             
         finally:
             # Clean up

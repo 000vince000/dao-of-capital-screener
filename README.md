@@ -127,21 +127,23 @@ capital slope are recorded with `roiic = None`. Writes `symbol`, `roiic`,
 ### Stage 5 — Summary
 
 `main.py` takes the top-N tickers by `rankingScore`, merges in ROIIC, and
-computes `growthGate = roiic - wacc` (positive = the company's reinvestment
-returns still clear its cost of capital). **`growthGate` is a directional
+computes `roiicSpread = roiic - wacc` (positive = the company's reinvestment
+returns still clear its cost of capital). **`roiicSpread` is a directional
 signal only, not a value-creation measure** — per Mauboussin & Callahan,
 "Return on Invested Capital" (Morgan Stanley Counterpoint Global, Oct 2022),
 comparing ROIIC to WACC overstates value creation when positive and
 understates it when negative, since it ignores the return on the existing
 (much larger) capital base. It is included for context but does not drive
-ranking or filtering. The final `top50_overview.csv` is sorted by
+ranking or filtering — named `roiicSpread` rather than the earlier
+`growthGate`, since that name implied a pass/fail threshold, exactly the
+misuse this repo avoids. The final `top50_overview.csv` is sorted by
 `rankingScore` ascending (best first) — the WACC-anchored comparison
 (`excessReturn = roic - wacc`) that the paper's methodology does support —
 and contains:
 
 `symbol`, `industry`, `MarketCap`, `EBIT`, `EnterpriseValue`, `roic`, `wacc`,
 `roiic`, `valueMetric`, `valueMetricRank`, `excessReturn`,
-`excessReturnRank`, `rankingScore`, `growthGate`.
+`excessReturnRank`, `rankingScore`, `roiicSpread`.
 
 ## Standalone comparison tools
 
@@ -245,7 +247,7 @@ calculation fails.
   How to Calculate ROIC and Handle Common
   Issues"](https://www.morganstanley.com/im/publication/insights/articles/article_returnoninvestedcapital.pdf),
   *Consilient Observer*, Morgan Stanley Investment Management / Counterpoint
-  Global Insights, October 6, 2022. Basis for the `growthGate` caveat in
+  Global Insights, October 6, 2022. Basis for the `roiicSpread` caveat in
   Stage 5 above (ROIIC vs. WACC is a directional signal, not a
   value-creation measure) and for the NOPAT/invested-capital/excess-return
   definitions this pipeline approximates.
