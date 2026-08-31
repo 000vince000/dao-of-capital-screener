@@ -143,6 +143,53 @@ and contains:
 `roiic`, `valueMetric`, `valueMetricRank`, `excessReturn`,
 `excessReturnRank`, `rankingScore`, `growthGate`.
 
+## Standalone comparison tools
+
+Not part of the orchestrated `main.py` pipeline — run manually as a second
+opinion before deciding whether to fold something into the live pipeline
+(same pattern as `normalize_ebit.py`).
+
+### `build_nopat_ic.py` — rebuild NOPAT/InvestedCapital from verified building blocks
+
+```bash
+python build_nopat_ic.py --tickers MSFT,SBUX,KHC
+python build_nopat_ic.py --input current_baseline_data.csv --output nopat_ic_comparison.csv
+```
+
+`current_baseline_data.py` computes `nopat = EBIT * (1 - TaxRateForCalcs)`
+using yahooquery's own `EBIT`/`InvestedCapital` fields directly. This script
+rebuilds both from Mauboussin & Callahan's operating-approach formula (see
+References) instead, using only fields verified live against yahooquery —
+not assumed from documentation:
+
+* Uses `OperatingIncome` in place of yahooquery's `EBIT` field, which was
+  confirmed to equal `PretaxIncome + InterestExpense` and wrongly folds in
+  non-operating income/expense (inflated NOPAT ~8.9% / overstated ROIC
+  ~2.3 points for MSFT).
+* Builds cash taxes as `TaxProvision − DeferredIncomeTax + interest tax
+  shield`. The sign on `DeferredIncomeTax` was verified empirically by
+  reconciling a full cash-flow-statement identity, not assumed from the
+  field name — it's the opposite sign from how the paper's own Exhibit 2
+  lists its "deferred taxes" cash-tax line.
+* Adds back goodwill/intangible impairment charges (`AssetImpairmentCharge`),
+  cross-checked against real 10-K/press figures rather than assumed: KHC's
+  FY2025 value matches their reported $6.7B goodwill + $2.6B intangible
+  impairment almost exactly; WBD's FY2024 value is close to their reported
+  $9.1B Networks goodwill impairment.
+* Strips excess cash from InvestedCapital using the broader "cash and
+  marketable securities" measure the paper specifies (not just narrow cash).
+* Explicitly flags — never silently zero-fills — paper adjustments
+  yahooquery can't supply: amortization of acquired intangibles, embedded
+  operating-lease interest, and the operating-lease right-of-use asset.
+
+Not wired into `main.py` — the live pipeline's ROIC/ranking are unchanged.
+Both the current-pipeline-style and rebuilt figures are computed from the
+same annual-period data so the comparison isolates formula choice, not
+data-period differences. Output columns: `symbol`, `fiscal_year_end`,
+`nopat_current`, `invested_capital_current`, `roic_current`,
+`nopat_rebuilt`, `invested_capital_rebuilt`, `roic_rebuilt`, `roic_delta`,
+`asset_impairment_addback`, `adjustments_skipped`.
+
 ## Output format — `current_baseline_data.csv`
 
 The resulting CSV (semicolon-separated) contains the following columns for
