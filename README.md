@@ -182,12 +182,32 @@ not assumed from documentation:
   yahooquery can't supply: amortization of acquired intangibles, embedded
   operating-lease interest, and the operating-lease right-of-use asset.
 
+Also reports **organic ROIC** (`roic_organic`) side by side with
+`roic_rebuilt` — InvestedCapital with acquired goodwill/intangibles
+subtracted entirely (paper's Exhibit 20 variant), never replacing or
+averaged with the face-value figure. This is a genuinely different kind of
+adjustment from the impairment add-back above: the paper states the
+impairment add-back flatly as standard practice, but presents organic vs.
+face-value ROIC as a real analytical choice (its own four-variant exhibit).
+For a capital-*allocation*-quality screen, face-value ROIC (acquired
+goodwill included) is the more honest answer to "did management deploy
+capital well" — overpaying for M&A is a real capital-allocation outcome,
+not an accounting artifact — so `roic_organic` is a diagnostic for
+understanding *why* a name's face-value ROIC is where it is (one-time bad
+acquisition vs. an ongoing pattern), not a ranking input. A negative or
+zero organic InvestedCapital (confirmed live: CSCO, whose goodwill and
+intangibles from decades of acquisitions exceed its entire rebuilt
+InvestedCapital) makes `roic_organic` an uninterpretable ratio, so it's
+left `None` rather than shown as a misleading number — the underlying
+`invested_capital_organic` stays visible so the reason is auditable.
+
 Not wired into `main.py` — the live pipeline's ROIC/ranking are unchanged.
 Both the current-pipeline-style and rebuilt figures are computed from the
 same annual-period data so the comparison isolates formula choice, not
 data-period differences. Output columns: `symbol`, `fiscal_year_end`,
 `nopat_current`, `invested_capital_current`, `roic_current`,
-`nopat_rebuilt`, `invested_capital_rebuilt`, `roic_rebuilt`, `roic_delta`,
+`nopat_rebuilt`, `invested_capital_rebuilt`, `roic_rebuilt`,
+`invested_capital_organic`, `roic_organic`, `roic_delta`,
 `asset_impairment_addback`, `adjustments_skipped`.
 
 ## Output format — `current_baseline_data.csv`

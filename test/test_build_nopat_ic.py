@@ -179,5 +179,57 @@ class TestComputeRebuiltInvestedCapital(unittest.TestCase):
         self.assertIsNone(m.compute_rebuilt_invested_capital(row_bs, row_inc))
 
 
+class TestComputeOrganicInvestedCapital(unittest.TestCase):
+    def test_subtracts_goodwill_and_intangibles(self):
+        row_bs = pd.Series({"Goodwill": 200.0, "OtherIntangibleAssets": 50.0})
+        organic = m.compute_organic_invested_capital(1000.0, row_bs)
+        self.assertAlmostEqual(organic, 750.0, delta=1e-6)
+
+    def test_missing_goodwill_and_intangibles_is_a_no_op(self):
+        row_bs = pd.Series({})  # no acquisitions on the balance sheet at all
+        organic = m.compute_organic_invested_capital(1000.0, row_bs)
+        self.assertAlmostEqual(organic, 1000.0, delta=1e-6)
+
+    def test_none_invested_capital_propagates_as_none(self):
+        row_bs = pd.Series({"Goodwill": 200.0, "OtherIntangibleAssets": 50.0})
+        self.assertIsNone(m.compute_organic_invested_capital(None, row_bs))
+
+    def test_qualitative_pattern_matches_paper_exhibit20_msft(self):
+        # Using this repo's own already-validated Exhibit 2/4 MSFT building
+        # blocks (nopat=66e9, invested_capital_rebuilt=152e9, see the other
+        # golden tests above) rather than the paper's exact headline 49%/94%
+        # figures, since this build already deviates from those headline
+        # numbers by construction (no EBITA add-back, no ROU asset - see
+        # adjustments_skipped). What this DOES verify: subtracting acquired
+        # goodwill/intangibles must always raise ROIC (same numerator,
+        # smaller denominator) - the qualitative direction the paper's
+        # Exhibit 20 shows (49% -> 94% for MSFT), not the exact magnitude.
+        nopat = 66e9
+        ic_rebuilt = 152e9
+        row_bs = pd.Series({"Goodwill": 68e9, "OtherIntangibleAssets": 11e9})
+
+        ic_organic = m.compute_organic_invested_capital(ic_rebuilt, row_bs)
+        self.assertAlmostEqual(ic_organic, 73e9, delta=1e8)  # 152 - 68 - 11
+
+        roic_rebuilt = nopat / ic_rebuilt
+        roic_organic = nopat / ic_organic
+        self.assertGreater(roic_organic, roic_rebuilt)
+
+
+class TestSafeRatio(unittest.TestCase):
+    def test_negative_denominator_returns_none_not_a_nonsense_ratio(self):
+        # Real case: CSCO's organic InvestedCapital came back negative
+        # (decades of M&A means goodwill+intangibles exceed its entire
+        # rebuilt InvestedCapital) - naive division produced a -625% "ROIC",
+        # not a real signal. Division by a negative or zero base isn't a
+        # meaningful return at all, not just undefined at exactly zero.
+        self.assertIsNone(m._safe_ratio(10.0, -5.0))
+        self.assertIsNone(m._safe_ratio(10.0, 0.0))
+        self.assertIsNone(m._safe_ratio(None, 10.0))
+
+    def test_positive_denominator_divides_normally(self):
+        self.assertAlmostEqual(m._safe_ratio(10.0, 4.0), 2.5)
+
+
 if __name__ == "__main__":
     unittest.main()

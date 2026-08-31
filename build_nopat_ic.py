@@ -108,6 +108,21 @@ Every row's `adjustments_skipped` column names which of the above were left
 out due to unavailable data - never silently defaulted to zero without saying
 so.
 
+Organic ROIC (side-by-side diagnostic, not a ranking input)
+-------------------------------------------------------------------------
+`roic_organic` / `invested_capital_organic` subtract acquired goodwill and
+intangibles from InvestedCapital entirely (paper's Exhibit 20 variant),
+reported alongside `roic_rebuilt`, never replacing it. Unlike the impairment
+add-back above, this is NOT a noise correction - the paper presents it as a
+genuine analytical choice (its own four-variant exhibit), and for a capital-
+*allocation*-quality screen, face-value ROIC (acquired goodwill included) is
+the more honest answer to "did management deploy capital well" - overpaying
+for M&A is a real capital-allocation outcome, not an accounting artifact.
+Divergence between roic_rebuilt and roic_organic is a research flag (is a
+low face-value ROIC a one-time bad acquisition, or a pattern?), not
+something to average or pick a winner from. See
+compute_organic_invested_capital()'s docstring for the full reasoning.
+
 Both the current-pipeline-style figures and the rebuilt figures are computed
 from the SAME annual-period data in this script (unlike the live pipeline,
 which uses quarterly TTM) so the comparison isolates the effect of formula
@@ -298,17 +313,65 @@ def compute_rebuilt_invested_capital(row_bs: pd.Series, row_inc: pd.Series,
     return nwc_adjusted + net_ppe + goodwill + intangibles + other_lt_assets
 
 
+def compute_organic_invested_capital(invested_capital_rebuilt: Optional[float], row_bs: pd.Series) -> Optional[float]:
+    """InvestedCapital with acquired goodwill and intangibles subtracted out
+    (paper's Exhibit 20 "subtract acquired goodwill and intangibles" variant,
+    holding the "no internally-generated-intangible capitalization" side
+    fixed, since that's out of scope for this build).
+
+    This is deliberately NOT the same kind of fix as the impairment add-back
+    in compute_rebuilt_nopat. That corrects a one-time accounting event that
+    doesn't reflect a given year's ongoing operating performance - the paper
+    states it flatly ("it is standard to add back goodwill and intangible
+    impairment charges"), no alternative view offered. Organic vs.
+    face-value ROIC is different in kind: it answers a genuinely different
+    question (organic capital efficiency vs. the full capital-allocation
+    track record, M&A included) that the paper itself presents as a real
+    analytical choice with no single right answer (its own four-variant
+    Exhibit 20, "two schools of thought" language elsewhere). For a
+    capital-*allocation*-quality screen, face-value ROIC is the more honest
+    answer to "did management deploy shareholder capital well" - overpaying
+    for an acquisition is a real capital allocation outcome, not noise - so
+    this is reported as a side-by-side diagnostic column, never used to
+    replace roic_rebuilt or feed the live pipeline's ranking.
+    """
+    if invested_capital_rebuilt is None:
+        return None
+    goodwill = _safe_num(row_bs.get("Goodwill"))
+    intangibles = _safe_num(row_bs.get("OtherIntangibleAssets"))
+    return invested_capital_rebuilt - goodwill - intangibles
+
+
+def _safe_ratio(numerator: Optional[float], denominator: Optional[float]) -> Optional[float]:
+    """numerator / denominator, or None if either is missing or denominator
+    isn't positive. A negative or zero InvestedCapital makes "ROIC" an
+    uninterpretable ratio (not just undefined at zero) - e.g. CSCO's
+    organic InvestedCapital is negative (decades of "buy vs. build" M&A
+    means goodwill+intangibles exceed its entire rebuilt InvestedCapital),
+    which would otherwise silently produce a nonsensical negative "return"
+    rather than an honest None.
+    """
+    if numerator is None or denominator is None or denominator <= 0:
+        return None
+    return numerator / denominator
+
+
 def compute_rebuilt_regime(row_inc: pd.Series, row_bs: pd.Series, row_cf: pd.Series) -> dict:
     nopat_result = compute_rebuilt_nopat(row_inc, row_cf)
     ic = compute_rebuilt_invested_capital(row_bs, row_inc)
 
     nopat = nopat_result["nopat_rebuilt"]
-    roic = (nopat / ic) if (nopat is not None and ic not in (None, 0)) else None
+    roic = _safe_ratio(nopat, ic)
+
+    ic_organic = compute_organic_invested_capital(ic, row_bs)
+    roic_organic = _safe_ratio(nopat, ic_organic)
 
     return {
         "nopat_rebuilt": nopat,
         "invested_capital_rebuilt": ic,
         "roic_rebuilt": roic,
+        "invested_capital_organic": ic_organic,
+        "roic_organic": roic_organic,
         "asset_impairment_addback": nopat_result.get("asset_impairment_addback"),
         "adjustments_skipped": ADJUSTMENTS_ALWAYS_SKIPPED,
     }
@@ -384,12 +447,15 @@ def main():
         rows.append(row)
 
         if row.get("status") == "ok":
-            print(
-                f"  · roic_current={row['roic_current']:.2%}  roic_rebuilt={row['roic_rebuilt']:.2%}  "
-                f"delta={row['roic_delta']:+.2%}"
-                if row["roic_current"] is not None and row["roic_rebuilt"] is not None
-                else "  · one or both ROIC values could not be computed (missing fields)"
-            )
+            if row["roic_current"] is not None and row["roic_rebuilt"] is not None:
+                organic = row.get("roic_organic")
+                organic_str = f"  organic={organic:.2%}" if organic is not None else ""
+                print(
+                    f"  · roic_current={row['roic_current']:.2%}  roic_rebuilt={row['roic_rebuilt']:.2%}  "
+                    f"delta={row['roic_delta']:+.2%}{organic_str}"
+                )
+            else:
+                print("  · one or both ROIC values could not be computed (missing fields)")
         else:
             print(f"  · {row.get('status')}")
 
