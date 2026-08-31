@@ -7,8 +7,24 @@ Steps:
 3. Run `normalized_austrian_screener.py` to refresh `normalized_austrian.csv`, with `current_baseline_data.csv` and `wacc_top.csv` as input.
 4. Sort `normalized_austrian.csv` by `rankingScore` ascending and pick the top *N* tickers (default 50).
 5. Run `compute_roiic.py` to refresh `roiic_top.csv`, with `normalized_austrian.csv` as input.
-6. Compute Growth Gate as roiic - wacc
-7. Merge the key metrics into a concise overview CSV (default: top50_overview.csv)
+6. Compute `growthGate` as roiic - wacc. This is a DIRECTIONAL signal only (is
+   reinvestment trending better or worse than the cost of capital) — per
+   Mauboussin & Callahan, "Return on Invested Capital" (Morgan Stanley
+   Counterpoint Global, Oct 2022), ROIIC should not be compared to WACC as a
+   true measure of economic value the way ROIC can be: it overstates value
+   creation when positive and understates it when negative, ignoring the
+   return on the (much larger) existing capital base. It is NOT used to rank
+   or filter the final output; `rankingScore`, built from `excessReturn`
+   (roic - wacc), is the WACC-anchored ranking metric.
+7. Merge the key metrics into a concise overview CSV, sorted by `rankingScore`
+   ascending (best first).
+
+Every CSV this pipeline writes — including the intermediate stage outputs —
+is dated and saved under `artifacts/` as `<run-date>_<name>.csv` rather than
+overwriting a fixed filename in the repo root. This preserves a historical
+record of each run's results (e.g. this year's screen vs. last year's) and
+keeps the repo root free of stale, regenerable data. `artifacts/` is
+git-ignored — it's a local record, not something committed.
 
 This script assumes it is executed from the project root where the individual
 Python modules reside.
@@ -18,6 +34,7 @@ from __future__ import annotations
 import argparse
 import subprocess
 import sys
+from datetime import date
 from pathlib import Path
 from typing import List
 
@@ -40,13 +57,13 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--output",
         type=Path,
-        default=Path("top50_overview.csv"),
-        help="Destination CSV filename (default: top50_overview.csv)",
+        default=None,
+        help="Destination CSV path (default: artifacts/<today>_top50_overview.csv)",
     )
     p.add_argument(
         "--skip-screener",
         action="store_true",
-        help="Skip running current_baseline_data.py if current_baseline_data.csv already exists.",
+        help="Skip running current_baseline_data.py if today's dated baseline CSV already exists.",
     )
     return p.parse_args()
 
@@ -57,7 +74,14 @@ def _parse_args() -> argparse.Namespace:
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
+ARTIFACTS_DIR = PROJECT_ROOT / "artifacts"
+RUN_DATE = date.today().isoformat()
 PYTHON = sys.executable  # current interpreter (inside venv if activated)
+
+
+def _dated(name: str) -> Path:
+    """Return artifacts/<RUN_DATE>_<name> — the dated output path for this run."""
+    return ARTIFACTS_DIR / f"{RUN_DATE}_{name}"
 
 
 def _run_script(script: str, *args: str):
@@ -75,17 +99,19 @@ def _run_script(script: str, *args: str):
 def main() -> None:
     args = _parse_args()
 
-    current_baseline_data_csv = PROJECT_ROOT / "current_baseline_data.csv"
+    ARTIFACTS_DIR.mkdir(exist_ok=True)
+
+    current_baseline_data_csv = _dated("current_baseline_data.csv")
     # ------------------------------------------------------------------
     # 1. Run the screener (unless skipped)
     # ------------------------------------------------------------------
     if not args.skip_screener or not current_baseline_data_csv.exists():
-        _run_script("current_baseline_data.py")
+        _run_script("current_baseline_data.py", "--output", str(current_baseline_data_csv))
     else:
-        print("✓ Skipping screener step – current_baseline_data.csv already present.")
+        print(f"✓ Skipping screener step – {current_baseline_data_csv.name} already present.")
 
     if not current_baseline_data_csv.exists():
-        print("❌ Expected current_baseline_data.csv was not created.", file=sys.stderr)
+        print(f"❌ Expected {current_baseline_data_csv} was not created.", file=sys.stderr)
         sys.exit(1)
 
     # ------------------------------------------------------------------
@@ -103,25 +129,36 @@ def main() -> None:
     # ------------------------------------------------------------------
     # 3. Refresh WACC for entire universe before ranking normalization
     # ------------------------------------------------------------------
-    wacc_csv = PROJECT_ROOT / "wacc_top.csv"
+    wacc_csv = _dated("wacc_top.csv")
+    wacc_failed_csv = _dated("wacc_failed.csv")
     if not wacc_csv.exists():
-        _run_script("fetch_wacc.py", "--input", str(current_baseline_data_csv), "--output", "wacc_top.csv")
+        _run_script(
+            "fetch_wacc.py",
+            "--input", str(current_baseline_data_csv),
+            "--output", str(wacc_csv),
+            "--failed-output", str(wacc_failed_csv),
+        )
     else:
-        print("✓ Skipping WACC fetch – wacc_top.csv already exists.")
+        print(f"✓ Skipping WACC fetch – {wacc_csv.name} already exists.")
 
     # ------------------------------------------------------------------
     # 4. Produce normalized screener with excess returns
     # ------------------------------------------------------------------
-    normalized_csv = PROJECT_ROOT / "normalized_austrian.csv"
+    normalized_csv = _dated("normalized_austrian.csv")
     if not normalized_csv.exists():
-        _run_script("normalized_austrian_screener.py", "--input", str(current_baseline_data_csv), "--wacc-file", "wacc_top.csv", "--output", "normalized_austrian.csv")
+        _run_script(
+            "normalized_austrian_screener.py",
+            "--input", str(current_baseline_data_csv),
+            "--wacc-file", str(wacc_csv),
+            "--output", str(normalized_csv),
+        )
     else:
-        print("✓ Skipping normalized screener – normalized_austrian.csv already exists.")
+        print(f"✓ Skipping normalized screener – {normalized_csv.name} already exists.")
 
     # ------------------------------------------------------------------
     # 5. Load normalized CSV and pick top-N
     # ------------------------------------------------------------------
-    norm_df = pd.read_csv("normalized_austrian.csv", sep=";")
+    norm_df = pd.read_csv(normalized_csv, sep=";")
     # Data is already sorted by rankingScore ascending (best first)
     top_df = norm_df.head(args.top)
     top_tickers = top_df["symbol"].dropna().astype(str).tolist()
@@ -129,24 +166,31 @@ def main() -> None:
     ticker_str = ",".join(top_tickers)
 
     # ------------------------------------------------------------------
-    # 6. Compute ROIIC for the full normalized dataset  
+    # 6. Compute ROIIC for the full normalized dataset
     # ------------------------------------------------------------------
-    roiic_csv = PROJECT_ROOT / "roiic_top.csv"
+    roiic_csv = _dated("roiic_top.csv")
     if not roiic_csv.exists():
-        _run_script("compute_roiic.py", "--input", "normalized_austrian.csv", "--output", "roiic_top.csv")
+        _run_script(
+            "compute_roiic.py",
+            "--input", str(normalized_csv),
+            "--baseline", str(current_baseline_data_csv),
+            "--output", str(roiic_csv),
+        )
     else:
-        print("✓ Skipping ROIIC computation – roiic_top.csv already exists.")
+        print(f"✓ Skipping ROIIC computation – {roiic_csv.name} already exists.")
 
     # ------------------------------------------------------------------
     # 7. Merge selected metrics into summary CSV
     # ------------------------------------------------------------------
     # Load ROIIC data
-    df_roiic = pd.read_csv("roiic_top.csv", sep=";")
+    df_roiic = pd.read_csv(roiic_csv, sep=";")
     
     # Merge top tickers with ROIIC data
     merged = top_df.merge(df_roiic[["symbol", "roiic"]], on="symbol", how="left")
     
-    # Compute Growth Gate as roiic - wacc (if both available)
+    # Compute Growth Gate as roiic - wacc (if both available).
+    # NOTE: directional context only, not a value-creation measure — see the
+    # module docstring. Never sort or filter on this column; use rankingScore.
     if "wacc" in merged.columns and "roiic" in merged.columns:
         merged["growthGate"] = merged["roiic"] - merged["wacc"]
 
@@ -206,10 +250,13 @@ def main() -> None:
             merged[col] = np.nan
     merged = merged[cols_order]
 
-    merged = merged.sort_values("growthGate", ascending=False)
+    # Sort by rankingScore (WACC-anchored via excessReturn), not growthGate —
+    # see module docstring on why roiic - wacc isn't a valid ranking metric.
+    merged = merged.sort_values("rankingScore", ascending=True)
 
-    merged.to_csv(args.output, sep=";", index=False)
-    print(f"✓ Saved summary → {args.output.resolve()}")
+    output_path = args.output or _dated("top50_overview.csv")
+    merged.to_csv(output_path, sep=";", index=False)
+    print(f"✓ Saved summary → {output_path.resolve()}")
 
 
 if __name__ == "__main__":

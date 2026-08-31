@@ -45,7 +45,7 @@ class TestMain(unittest.TestCase):
         with patch('sys.argv', ['main.py']):
             args = main._parse_args()
             self.assertEqual(args.top, 50)
-            self.assertEqual(args.output, Path("top50_overview.csv"))
+            self.assertIsNone(args.output)  # resolved to artifacts/<date>_top50_overview.csv at write time
             self.assertFalse(args.skip_screener)
 
     def test_parse_args_custom(self):

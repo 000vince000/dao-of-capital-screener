@@ -128,8 +128,16 @@ capital slope are recorded with `roiic = None`. Writes `symbol`, `roiic`,
 
 `main.py` takes the top-N tickers by `rankingScore`, merges in ROIIC, and
 computes `growthGate = roiic - wacc` (positive = the company's reinvestment
-returns still clear its cost of capital). The final `top50_overview.csv` is
-sorted by `growthGate` descending and contains:
+returns still clear its cost of capital). **`growthGate` is a directional
+signal only, not a value-creation measure** — per Mauboussin & Callahan,
+"Return on Invested Capital" (Morgan Stanley Counterpoint Global, Oct 2022),
+comparing ROIIC to WACC overstates value creation when positive and
+understates it when negative, since it ignores the return on the existing
+(much larger) capital base. It is included for context but does not drive
+ranking or filtering. The final `top50_overview.csv` is sorted by
+`rankingScore` ascending (best first) — the WACC-anchored comparison
+(`excessReturn = roic - wacc`) that the paper's methodology does support —
+and contains:
 
 `symbol`, `industry`, `MarketCap`, `EBIT`, `EnterpriseValue`, `roic`, `wacc`,
 `roiic`, `valueMetric`, `valueMetricRank`, `excessReturn`,
@@ -163,5 +171,16 @@ each ticker that could be processed successfully:
 
 Values can be negative, zero, or missing if data is unavailable or a
 calculation fails.
+
+## References
+
+* Michael J. Mauboussin and Dan Callahan, CFA, ["Return on Invested Capital:
+  How to Calculate ROIC and Handle Common
+  Issues"](https://www.morganstanley.com/im/publication/insights/articles/article_returnoninvestedcapital.pdf),
+  *Consilient Observer*, Morgan Stanley Investment Management / Counterpoint
+  Global Insights, October 6, 2022. Basis for the `growthGate` caveat in
+  Stage 5 above (ROIIC vs. WACC is a directional signal, not a
+  value-creation measure) and for the NOPAT/invested-capital/excess-return
+  definitions this pipeline approximates.
 
 ---
