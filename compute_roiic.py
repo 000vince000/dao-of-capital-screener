@@ -63,16 +63,176 @@ warnings.filterwarnings("ignore", category=UserWarning, module="yahooquery")
 from data_fetch_utils import fetch_with_backoff, RateLimitExceeded, BASE_DELAY_SEC
 
 # --------------------------------------------------------------------------------------
+# Shared one-time-item normalization (Step 1 of the ROIIC improvement plan)
+# --------------------------------------------------------------------------------------
+
+SPIKE_PRONE_COLS = [
+    "ResearchAndDevelopment",
+    "SellingGeneralAndAdministration",
+    "RestructuringAndMergernAcquisition",
+]
+
+
+def normalize_annual_series(df: pd.DataFrame, spike_multiple: float = 2.0) -> pd.DataFrame:
+    """Flag and normalize one-time items across a whole annual EBIT/tax series
+    before it feeds the ROIIC regression.
+
+    This is the whole-series counterpart to the trailing-TTM normalization in
+    normalize_ebit.py (see that file for the original rationale: raw GAAP EBIT
+    can swing on a single quarter/year's acquired-IPR&D charge, restructuring,
+    or other one-off item). Both compute_roiic.py (live pipeline, yahooquery
+    data) and sec_edgar_backtest.py (SEC XBRL data) shape their annual data
+    into this same column layout and call this one function, so the two stay
+    consistent rather than drifting apart as two implementations.
+
+    Expected columns: 'EBIT', 'TaxRateForCalcs'. Optional (skipped gracefully
+    if absent): 'PretaxIncome' (enables tax-rate sanity correction),
+    'ResearchAndDevelopment', 'SellingGeneralAndAdministration',
+    'RestructuringAndMergernAcquisition', 'TotalUnusualItems'.
+
+    Returns the same rows plus: 'EBIT_normalized', 'TaxRateForCalcs_normalized',
+    'flagged' (bool), 'flag_reasons' (str), 'addback' (float).
+    """
+    d = df.copy().reset_index(drop=True)
+    if d.empty:
+        d["EBIT_normalized"] = d.get("EBIT")
+        d["TaxRateForCalcs_normalized"] = d.get("TaxRateForCalcs")
+        d["flagged"] = pd.Series(dtype=bool)
+        d["flag_reasons"] = pd.Series(dtype=str)
+        d["addback"] = pd.Series(dtype=float)
+        return d
+
+    # Defensive: different data sources (yahooquery vs. hand-built SEC XBRL series)
+    # can leave a column as object-dtype full of Python None rather than a proper
+    # float NaN (e.g. a tag with no data before a certain year). That silently
+    # breaks downstream numpy/scipy arithmetic in confusing ways, so coerce here.
+    numeric_cols = ["EBIT", "TaxRateForCalcs", "PretaxIncome", "TotalUnusualItems"] + SPIKE_PRONE_COLS
+    for col in numeric_cols:
+        if col in d.columns:
+            d[col] = pd.to_numeric(d[col], errors="coerce")
+
+    def _baseline(col: str, exclude_mask: pd.Series) -> Optional[float]:
+        if col not in d.columns:
+            return None
+        vals = d.loc[~exclude_mask, col].dropna()
+        vals = vals[vals > 0]
+        return float(vals.median()) if len(vals) >= 2 else None
+
+    exclude = pd.Series(False, index=d.index)
+    flagged = pd.Series(False, index=d.index)
+    reasons_col = pd.Series("", index=d.index)
+    addback_col = pd.Series(0.0, index=d.index)
+
+    # Two passes: first pass flags against the whole-series baseline, second
+    # pass re-flags against a baseline that excludes anything already flagged,
+    # so one bad year can't drag down the baseline used to judge another.
+    for _pass in range(2):
+        new_exclude = exclude.copy()
+        for idx, row in d.iterrows():
+            reasons = []
+            addback = 0.0
+
+            unusual = row.get("TotalUnusualItems")
+            if pd.notna(unusual) and unusual != 0:
+                addback += -float(unusual)
+                reasons.append(f"TotalUnusualItems={unusual:,.0f}")
+
+            for col in SPIKE_PRONE_COLS:
+                if col not in row.index or pd.isna(row[col]):
+                    continue
+                baseline = _baseline(col, exclude if _pass == 0 else new_exclude)
+                if baseline is None:
+                    continue
+                if row[col] > spike_multiple * baseline:
+                    excess = float(row[col]) - baseline
+                    addback += excess
+                    reasons.append(f"{col}={row[col]:,.0f} vs baseline {baseline:,.0f} (+{excess:,.0f})")
+
+            if reasons:
+                new_exclude.loc[idx] = True
+                flagged.loc[idx] = True
+                reasons_col.loc[idx] = "; ".join(reasons)
+                addback_col.loc[idx] = addback
+            else:
+                new_exclude.loc[idx] = False
+                flagged.loc[idx] = False
+                reasons_col.loc[idx] = ""
+                addback_col.loc[idx] = 0.0
+        exclude = new_exclude
+
+    d["flagged"] = flagged
+    d["flag_reasons"] = reasons_col
+    d["addback"] = addback_col
+    d["EBIT_normalized"] = d["EBIT"] + d["addback"]
+
+    d["TaxRateForCalcs_normalized"] = d["TaxRateForCalcs"]
+    if "PretaxIncome" in d.columns:
+        clean = d[(d["PretaxIncome"] > 0) & (~d["flagged"])]
+        if clean.empty:
+            clean = d[d["PretaxIncome"] > 0]
+        if not clean.empty:
+            normalized_tax_rate = float(clean["TaxRateForCalcs"].median())
+            bad_tax = d["flagged"] | (d["PretaxIncome"] <= 0)
+            d.loc[bad_tax, "TaxRateForCalcs_normalized"] = normalized_tax_rate
+
+    return d
+
+
+def apply_buyback_addback(df: pd.DataFrame, *, ic_col: str = "InvestedCapital", buyback_col: str = "RepurchaseOfCapitalStock") -> pd.DataFrame:
+    """Add back cumulative share buybacks to InvestedCapital before it feeds
+    the ROIIC regression (TODO.md #4).
+
+    A buyback pays cash to shareholders and shrinks equity (via treasury
+    stock), reducing InvestedCapital = Debt + Equity - Cash on *both* legs,
+    even though it has zero effect on the operating assets (PP&E, working
+    capital) that actually generate NOPAT. Left uncorrected, buyback-heavy
+    but genuinely growing businesses can show a flat or shrinking IC trend
+    that either trips the "ΔIC/IC₀ < 10%" filter (silently dropping the
+    ROIIC signal entirely - this happened to IT, NTAP, BBWI, WMT, PFE) or
+    biases the regression slope on a financing decision rather than the
+    operating economics ROIIC is meant to measure.
+
+    Fix: add back the cumulative buyback spend, from the first row of the
+    given window onward, to InvestedCapital each year - reconstructing what
+    IC would have been had that cash never been returned to shareholders.
+    This never touches NOPAT (buybacks don't affect operating profit), so it
+    isolates the piece of IC that actually correlates with what generates
+    NOPAT, at the cost of not correcting for other financing-side noise
+    (debt-funded dividends, M&A/goodwill swings) - see TODO.md for why that
+    bigger fix (rebuilding IC from the asset side) was deferred.
+
+    Rows must be pre-sorted chronologically (oldest first). buyback_col is
+    read as a magnitude (sign-agnostic - abs() applied), 0/NaN treated as no
+    buyback that period. Returns the same rows plus '{ic_col}_organic'.
+    """
+    d = df.copy().reset_index(drop=True)
+    organic_col = f"{ic_col}_organic"
+    if ic_col not in d.columns:
+        return d
+    ic_numeric = pd.to_numeric(d[ic_col], errors="coerce")
+    if buyback_col not in d.columns:
+        d[organic_col] = ic_numeric
+        return d
+    magnitude = pd.to_numeric(d[buyback_col], errors="coerce").abs().fillna(0.0)
+    cumulative_buyback = magnitude.cumsum()
+    d[organic_col] = ic_numeric + cumulative_buyback
+    return d
+
+# --------------------------------------------------------------------------------------
 # Batch-fetch helpers
 # --------------------------------------------------------------------------------------
 
 
-def _batch_fetch_annual(symbols: list[str], delay_ref: list[float]) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Return (income_df, balance_df) for *symbols* using one Yahooquery call.
+def _batch_fetch_annual(symbols: list[str], delay_ref: list[float]) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Return (income_df, balance_df, cashflow_df) for *symbols* using one Yahooquery call.
 
-    Both DataFrames are indexed by ``symbol`` and contain **all** rows returned by
+    All DataFrames are indexed by ``symbol`` and contain **all** rows returned by
     Yahoo.  If the request fails with a non-rate-limit error we propagate the
     exception so the caller can decide how to handle it.
+
+    cashflow_df feeds apply_buyback_addback() (TODO.md #4) - a failure fetching
+    it is non-fatal (falls back to an empty frame), since the buyback
+    adjustment gracefully no-ops without it.
     """
 
     ticker = Ticker(symbols, asynchronous=True)
@@ -89,14 +249,27 @@ def _batch_fetch_annual(symbols: list[str], delay_ref: list[float]) -> tuple[pd.
         delay_ref=delay_ref,
     )
 
+    try:
+        cashflow_df = fetch_with_backoff(
+            lambda: ticker.cash_flow(frequency="a"),
+            desc=f"annual cash flow batch {len(symbols)} syms",
+            delay_ref=delay_ref,
+        )
+    except RateLimitExceeded:
+        raise
+    except Exception:
+        cashflow_df = pd.DataFrame()
+
     # Ensure DataFrame shape even on single-symbol batches
     if not isinstance(income_df, pd.DataFrame):
         income_df = pd.DataFrame()
     if not isinstance(balance_df, pd.DataFrame):
         balance_df = pd.DataFrame()
+    if not isinstance(cashflow_df, pd.DataFrame):
+        cashflow_df = pd.DataFrame()
 
     # Yahooquery sometimes returns multi-index (symbol, asOfDate). Reset index for easier slicing.
-    for df in (income_df, balance_df):
+    for df in (income_df, balance_df, cashflow_df):
         if isinstance(df.index, pd.MultiIndex):
             df.reset_index(level=0, inplace=True)
         elif "symbol" not in df.columns:
@@ -108,7 +281,7 @@ def _batch_fetch_annual(symbols: list[str], delay_ref: list[float]) -> tuple[pd.
         if df.index.name == "symbol":  # rare case
             df.reset_index(inplace=True)
 
-    return income_df, balance_df
+    return income_df, balance_df, cashflow_df
 
 
 def _process_symbol_from_batch(
@@ -116,25 +289,32 @@ def _process_symbol_from_batch(
     inc_df: pd.DataFrame,
     bs_df: pd.DataFrame,
     baseline_data: Optional[pd.DataFrame],
-) -> tuple[str, Optional[float], int, str | None]:
+    cf_df: Optional[pd.DataFrame] = None,
+) -> tuple[str, Optional[float], int, str | None, Optional[float]]:
     """Compute ROIIC for *symbol* using already-fetched DataFrames.
 
-    Returns (symbol, roiic, data_points, reason).
+    Returns (symbol, roiic, data_points, reason, roiic_raw). ``roiic`` is the
+    buyback-adjusted ("organic") value used as the pipeline's primary signal;
+    ``roiic_raw`` is the same regression on unadjusted InvestedCapital, kept
+    alongside it rather than discarded - see TODO.md #4 for why the two can
+    legitimately disagree (e.g. BBWI) and why that disagreement is itself
+    worth surfacing rather than collapsing into a single number.
     """
     # Slice data for this symbol; Yahooquery upper-cases symbols already
     inc_slice = inc_df[inc_df["symbol"] == symbol]
     bs_slice = bs_df[bs_df["symbol"] == symbol]
+    cf_slice = cf_df[cf_df["symbol"] == symbol] if cf_df is not None and not cf_df.empty and "symbol" in cf_df.columns else None
 
     if inc_slice.empty or bs_slice.empty:
-        return symbol, None, 0, "no Yahoo data"
+        return symbol, None, 0, "no Yahoo data", None
 
     # Early InvestedCapital presence check
     if "InvestedCapital" not in bs_slice.columns:
-        return symbol, None, 0, "InvestedCapital missing"
+        return symbol, None, 0, "InvestedCapital missing", None
 
-    hist = compute_nopat_and_invested_capital(inc_slice, bs_slice)
+    hist = compute_nopat_and_invested_capital(inc_slice, bs_slice, cf_slice)
     if hist.empty:
-        return symbol, None, 0, "historical merge empty"
+        return symbol, None, 0, "historical merge empty", None
 
     # Supplement with baseline year if useful
     if baseline_data is not None:
@@ -149,12 +329,16 @@ def _process_symbol_from_batch(
                             "year": [year],
                             "nopat": [base_row["nopat"].iloc[0]],
                             "InvestedCapital": [base_row["InvestedCapital"].iloc[0]],
+                            "InvestedCapital_organic": [base_row["InvestedCapital"].iloc[0]],
                         }
                     ),
                 ], ignore_index=True)
 
-    roiic, reason = compute_roiic_slope(hist, with_reason=True)
-    return symbol, roiic, len(hist), reason
+    roiic, reason = compute_roiic_slope(hist[["year", "nopat", "InvestedCapital_organic"]].rename(
+        columns={"InvestedCapital_organic": "InvestedCapital"}
+    ), with_reason=True)
+    roiic_raw, _ = compute_roiic_slope(hist[["year", "nopat", "InvestedCapital"]], with_reason=True)
+    return symbol, roiic, len(hist), reason, roiic_raw
 
 
 def fetch_annual_data(symbol: str, delay_ref: List[float]) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -178,27 +362,59 @@ def fetch_annual_data(symbol: str, delay_ref: List[float]) -> Tuple[pd.DataFrame
     return income_annual, balance_annual
 
 
-def compute_nopat_and_invested_capital(income_df: pd.DataFrame, balance_df: pd.DataFrame) -> pd.DataFrame:
-    """Compute NOPAT and InvestedCapital for annual data points."""
+def compute_nopat_and_invested_capital(
+    income_df: pd.DataFrame,
+    balance_df: pd.DataFrame,
+    cashflow_df: Optional[pd.DataFrame] = None,
+    *,
+    normalize: bool = True,
+    adjust_buybacks: bool = True,
+) -> pd.DataFrame:
+    """Compute NOPAT and InvestedCapital for annual data points.
+
+    normalize: apply normalize_annual_series() to the EBIT/tax inputs first
+    (default True). Set False to reproduce the pre-normalization behaviour.
+    adjust_buybacks: apply apply_buyback_addback() to InvestedCapital when
+    cashflow_df is supplied (default True; no-ops if cashflow_df is None or
+    lacks a RepurchaseOfCapitalStock column - see TODO.md #4).
+    """
     # Filter for the symbol and merge on asOfDate
     if income_df.empty or balance_df.empty:
         return pd.DataFrame()
-    
+
     # Filter for annual data only (periodType == '12M')
     if 'periodType' in income_df.columns:
         income_annual_only = income_df[income_df['periodType'] == '12M']
     else:
         income_annual_only = income_df
-        
+
     if 'periodType' in balance_df.columns:
         balance_annual_only = balance_df[balance_df['periodType'] == '12M']
     else:
         balance_annual_only = balance_df
-    
+
     # Get the most recent 8 years of data (to have enough points)
     income_recent = income_annual_only.sort_values("asOfDate").tail(8)
     balance_recent = balance_annual_only.sort_values("asOfDate").tail(8)
-    
+
+    buyback_by_date: dict = {}
+    if adjust_buybacks and cashflow_df is not None and not cashflow_df.empty:
+        cf = cashflow_df
+        if 'periodType' in cf.columns:
+            cf = cf[cf['periodType'] == '12M']
+        if 'RepurchaseOfCapitalStock' in cf.columns:
+            cf_recent = cf.sort_values("asOfDate").tail(8)
+            buyback_by_date = dict(zip(cf_recent["asOfDate"], cf_recent["RepurchaseOfCapitalStock"]))
+
+    if normalize and not income_recent.empty:
+        norm_cols = ["asOfDate", "EBIT", "TaxRateForCalcs"] + [
+            c for c in SPIKE_PRONE_COLS + ["PretaxIncome", "TotalUnusualItems"] if c in income_recent.columns
+        ]
+        normalized = normalize_annual_series(income_recent[norm_cols])
+        income_recent = income_recent.copy()
+        income_recent["EBIT"] = normalized["EBIT_normalized"].values
+        income_recent["TaxRateForCalcs"] = normalized["TaxRateForCalcs_normalized"].values
+
     # Clean data before merging (drop rows with NaN in required columns)
     income_clean = income_recent[["asOfDate", "EBIT", "TaxRateForCalcs"]].dropna()
     balance_clean = balance_recent[["asOfDate", "InvestedCapital"]].dropna()
@@ -216,11 +432,27 @@ def compute_nopat_and_invested_capital(income_df: pd.DataFrame, balance_df: pd.D
     
     # Compute NOPAT = EBIT * (1 - TaxRate)
     merged["nopat"] = merged["EBIT"] * (1 - merged["TaxRateForCalcs"])
-    
+
     # Extract year from asOfDate for regression
     merged["year"] = pd.to_datetime(merged["asOfDate"]).dt.year
-    
-    return merged[["year", "nopat", "InvestedCapital"]].dropna()
+
+    # Keep BOTH the raw and buyback-adjusted ("organic") InvestedCapital -
+    # they can diverge sharply for heavy-buyback names (see TODO.md #4), and
+    # that divergence is itself informative rather than something to collapse
+    # into one number: it flags names whose incremental-capital story hinges
+    # on a judgment call about whether the buybacks were prudent capital
+    # discipline or value-destructive, which this pipeline can't resolve on
+    # its own.
+    if buyback_by_date:
+        merged = merged.sort_values("asOfDate").reset_index(drop=True)
+        merged["RepurchaseOfCapitalStock"] = merged["asOfDate"].map(buyback_by_date)
+        merged = apply_buyback_addback(merged)
+    else:
+        merged["InvestedCapital_organic"] = merged["InvestedCapital"]
+
+    return merged[["year", "nopat", "InvestedCapital", "InvestedCapital_organic"]].dropna(
+        subset=["year", "nopat", "InvestedCapital"]
+    )
 
 
 def compute_roiic_slope(data: pd.DataFrame, *, with_reason: bool = False) -> Optional[float] | tuple[Optional[float], str | None]:
@@ -242,9 +474,9 @@ def compute_roiic_slope(data: pd.DataFrame, *, with_reason: bool = False) -> Opt
     # Sort by year to ensure proper time series
     data = data.sort_values("year")
     
-    years = data["year"].values
-    nopat = data["nopat"].values
-    invested_capital = data["InvestedCapital"].values
+    years = data["year"].astype(float).values
+    nopat = data["nopat"].astype(float).values
+    invested_capital = data["InvestedCapital"].astype(float).values
 
     # ------------------------------------------------------------------
     # Filter A – ensure the capital base moved by at least 10 %
@@ -254,15 +486,19 @@ def compute_roiic_slope(data: pd.DataFrame, *, with_reason: bool = False) -> Opt
     if ic_first == 0 or abs(ic_last - ic_first) / abs(ic_first) < 0.10:
         return (None, "ΔIC/IC₀ < 10 %") if with_reason else None
 
-    # Fit linear regression: y = slope * x + intercept
+    # Fit slope via Theil-Sen: the median of the pairwise slope between every
+    # two years in the window, rather than OLS's squared-error-minimizing
+    # line. Same target quantity (marginal NOPAT per unit of marginal
+    # InvestedCapital), just far less swayed by a single noisy year - see
+    # TODO.md #3. Note theilslopes takes (y, x), the reverse of linregress.
     try:
-        nopat_slope, _, _, _, _ = stats.linregress(years, nopat)
-        ic_slope, _, _, _, _ = stats.linregress(years, invested_capital)
-        
+        nopat_slope, _, _, _ = stats.theilslopes(nopat, years)
+        ic_slope, _, _, _ = stats.theilslopes(invested_capital, years)
+
         # Avoid division by zero (but negative denominators are valid)
         if ic_slope == 0:
             return (None, "IC slope = 0") if with_reason else None
-            
+
         roiic_raw = nopat_slope / ic_slope
 
         # ------------------------------------------------------------------
@@ -470,7 +706,7 @@ def main():
         print(f"Fetching batch {start + 1}–{start + len(chunk)} / {len(symbols)}", flush=True)
 
         try:
-            inc_df, bs_df = _batch_fetch_annual(chunk, delay_ref)
+            inc_df, bs_df, cf_df = _batch_fetch_annual(chunk, delay_ref)
         except RateLimitExceeded:
             print("❌ Rate limit exceeded during batch fetch – aborting", flush=True)
             break
@@ -483,13 +719,13 @@ def main():
 
         for sym in chunk:
             print(f"  · Processing {sym}...", flush=True)
-            sym_r, roiic, pts, reason = _process_symbol_from_batch(sym, inc_df, bs_df, baseline_data)
+            sym_r, roiic, pts, reason, roiic_raw = _process_symbol_from_batch(sym, inc_df, bs_df, baseline_data, cf_df)
             if roiic is not None:
-                print(f"    ROIIC: {roiic:.4f} ({pts} pts)")
+                print(f"    ROIIC: {roiic:.4f} ({pts} pts, raw={roiic_raw})")
             else:
                 print(f"    Skipped – {reason}")
 
-            results.append({"symbol": sym_r, "roiic": roiic, "data_points_used": pts})
+            results.append({"symbol": sym_r, "roiic": roiic, "roiic_raw": roiic_raw, "data_points_used": pts})
 
     results_df = pd.DataFrame(results)
     
